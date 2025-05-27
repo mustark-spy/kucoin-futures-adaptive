@@ -334,15 +334,21 @@ class GridTradingBotFutures:
         lower, upper = self.calculate_atr_bounds()
         self.grid_prices = [lower + i * (upper - lower) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
 
-        # --- Taille de chaque ordre (int) ---
-        usdt_per = BUDGET / GRID_SIZE
-        center   = (lower + upper) / 2
-        # Nombre de contrats = budget par niveau * leverage / prix moyen
+        # ❇️ BUDGET total à répartir sur tous les ordres (BUY + SELL)
+        total_orders = GRID_SIZE * 2
+        usdt_per     = BUDGET / total_orders    # budget alloué à CHAQUE ordre
+        center       = (lower + upper) / 2
+
+        # nombre de contrats calculé à partir de la marge par ordre
         size_f = usdt_per * LEVERAGE / center
         size   = math.floor(size_f)
-        # Si on ne peut pas ouvrir au moins 1 contrat, on skip tout
+
         if size < 1:
-            self.logger.warning(f"Budget insuffisant pour 1 contrat (size_f={size_f:.4f}), skip adjust_grid")
+            self.logger.warning(
+                f"Budget insuffisant pour 1 contrat par ordre " 
+                f"(size_f={size_f:.4f} → size=0). "
+                f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
+            )
             return
         # --- Placement des ordres avec arrondi au tick ---
         for p in self.grid_prices:
