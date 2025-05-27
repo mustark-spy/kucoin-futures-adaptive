@@ -1,0 +1,3 @@
+python-dotenv>=0.21.0
+kucoin-universal-sdk>=1.2.1
+python-telegram-bot[job-queue]>=20.0
