@@ -320,6 +320,7 @@ class GridTradingBotFutures:
             GetSymbolReqBuilder().set_symbol(SYMBOL).build()
         )
         tick = float(symbol_info.tick_size)
+        multiplier= float(symbol_info.multiplier)       # valeur en BTC d’un contrat (0.001)
         try:
             decimals = int(round(-math.log10(tick)))
         except Exception:
@@ -336,17 +337,19 @@ class GridTradingBotFutures:
 
         # ❇️ BUDGET total à répartir sur tous les ordres (BUY + SELL)
         total_orders = GRID_SIZE * 2
-        usdt_per     = BUDGET / total_orders    # budget alloué à CHAQUE ordre
-        center       = (lower + upper) / 2
+        usdt_per     = BUDGET / total_orders       # budget USDT par ordre
+        center       = (lower + upper) / 2         # prix moyen spot/futures
 
-        # nombre de contrats calculé à partir de la marge par ordre
-        size_f = usdt_per * LEVERAGE / center
-        size   = math.floor(size_f)
+        # 1) calculer la quantité BTC que la marge permet
+        btc_amount = usdt_per * LEVERAGE / center
+        # 2) convertir en nombre de contrats
+        size_f     = btc_amount / multiplier
+        size       = math.floor(size_f)
 
         if size < 1:
             self.logger.warning(
-                f"Budget insuffisant pour 1 contrat par ordre " 
-                f"(size_f={size_f:.4f} → size=0). "
+                f"Budget insuffisant pour 1 contrat par ordre "
+                f"(size_f={size_f:.2f} contrats) – skip adjust_grid. "
                 f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
             )
             return
