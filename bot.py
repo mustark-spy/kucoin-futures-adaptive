@@ -307,8 +307,9 @@ class GridTradingBotFutures:
             detail = self.futures_service.get_order_api().get_order_by_order_id(
                 FuturesGetOrderReqBuilder().set_order_id(oid).build()
             )
-            # On considère que le status "done" (case insensitive) signifie exécution
-            return detail.status.lower() == "done"
+            # récupérer la valeur string de l'enum
+            status = detail.status.value if hasattr(detail.status, "value") else str(detail.status)
+            return status.lower() == "done"
         except Exception as e:
             self.logger.error(f"check_order_filled error: {e}")
             return False
@@ -336,9 +337,13 @@ class GridTradingBotFutures:
         # --- Taille de chaque ordre (int) ---
         usdt_per = BUDGET / GRID_SIZE
         center   = (lower + upper) / 2
-        size_f   = usdt_per / center * LEVERAGE
-        size     = max(1, math.floor(size_f))
-
+        # Nombre de contrats = budget par niveau * leverage / prix moyen
+        size_f = usdt_per * LEVERAGE / center
+        size   = math.floor(size_f)
+        # Si on ne peut pas ouvrir au moins 1 contrat, on skip tout
+        if size < 1:
+            self.logger.warning(f"Budget insuffisant pour 1 contrat (size_f={size_f:.4f}), skip adjust_grid")
+            return
         # --- Placement des ordres avec arrondi au tick ---
         for p in self.grid_prices:
             buy_price  = round(p / tick) * tick
