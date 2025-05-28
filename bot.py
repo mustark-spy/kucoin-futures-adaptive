@@ -406,10 +406,10 @@ class GridTradingBotFutures:
                 self.active_orders.remove(o)
                 await self.app.bot.send_message(
                     chat_id=self.chat_id,
-                    text=f"✔ <b>Order Filled</b> ID: <code>{oid}</code> Side: <b>{side.name}</b> @ <code>{p:.4f}</code>",
+                    text=f"✔ <b>Order Filled</b> ID: <code>{oid}</code> Side: <b>{side.upper()}</b> @ <code>{p:.4f}</code>",
                     parse_mode='HTML'
                 )
-            if side == MarketSide.BUY and price <= p * (1 - STOP_LOSS):
+            if side == MarketSide.BUY.value and price <= p * (1 - STOP_LOSS):
                 changed = True
                 self.cancel_futures_order(oid)
                 self.active_orders.remove(o)
@@ -418,7 +418,7 @@ class GridTradingBotFutures:
                     text=f"🛑 <b>Stop-Loss</b> BUY @ <code>{p:.4f}</code>",
                     parse_mode='HTML'
                 )
-            if side == MarketSide.SELL and price >= p * (1 + TAKE_PROFIT):
+            if side == MarketSide.SELL.value and price >= p * (1 + TAKE_PROFIT):
                 changed = True
                 self.cancel_futures_order(oid)
                 self.active_orders.remove(o)
@@ -457,8 +457,11 @@ class GridTradingBotFutures:
         jq = self.app.job_queue
         # Notification de démarrage
         jq.run_once(self.startup_notify, when=0)
-        # Construction initiale de la grille dès startup
-        jq.run_once(self.adjust_grid, when=1)
+        if not self.active_orders:
+            # Construction initiale de la grille dès startup
+            jq.run_once(self.adjust_grid, when=1)
+        else:
+            self.logger.info("Ordres rechargés, skip initial grid adjust")
         # Planification des ajustements périodiques
         jq.run_repeating(self.adjust_grid, interval=ADJUST_INTERVAL_MIN * 60, first=ADJUST_INTERVAL_MIN * 60)
         # Monitoring des ordres
