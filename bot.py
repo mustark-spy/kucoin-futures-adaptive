@@ -453,7 +453,34 @@ class GridTradingBotFutures:
             parse_mode='HTML'
         )
 
-    def run(self) -> None:
+    
+    async def check_position_pnl(self, context=None) -> None:
+        try:
+            position = self.futures_service.get_position_api().get_position_by_symbol(SYMBOL)
+            if not position or float(position.available_qty) == 0:
+                return  # Pas de position ouverte
+
+            entry_price = float(position.entry_price)
+            mark_price = float(position.mark_price)
+            size = float(position.available_qty)
+            side = position.side.lower()  # 'long' ou 'short'
+
+            pnl_pct = (mark_price - entry_price) / entry_price if side == 'long' else (entry_price - mark_price) / entry_price
+
+            if pnl_pct >= TAKE_PROFIT:
+                self.logger.info(f"TP atteint {pnl_pct:.2%}, clôture position")
+                self.futures_service.get_order_api().close_position(SYMBOL, "market")
+                await self.app.bot.send_message(chat_id=self.chat_id, text=f"🎯 <b>TP atteint</b>: {pnl_pct:.2%} — Position clôturée", parse_mode="HTML")
+
+            elif pnl_pct <= -STOP_LOSS:
+                self.logger.info(f"SL atteint {pnl_pct:.2%}, clôture position")
+                self.futures_service.get_order_api().close_position(SYMBOL, "market")
+                await self.app.bot.send_message(chat_id=self.chat_id, text=f"🛑 <b>SL atteint</b>: {pnl_pct:.2%} — Position clôturée", parse_mode="HTML")
+
+        except Exception as e:
+            self.logger.error(f"check_position_pnl error: {e}")
+
+def run(self) -> None:
         jq = self.app.job_queue
         # Notification de démarrage
         jq.run_once(self.startup_notify, when=0)
@@ -468,6 +495,7 @@ class GridTradingBotFutures:
         jq.run_repeating(self.monitor_orders, interval=5, first=10)
         # Rapport PnL
         jq.run_repeating(self.pnl_report, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
+        jq.run_repeating(self.check_position_pnl, interval=10, first=15)
         # Démarrage du bot
         self.app.run_polling()
 
