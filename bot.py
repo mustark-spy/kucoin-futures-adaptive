@@ -1,3 +1,4 @@
+from kucoin_universal_sdk.generate.futures.account import GetPositionListData
 #!/usr/bin/env python3
 """
 Bot de Trading Telegram Futures ATR avec Persistence, Sandbox, Notifications Enrichies et Commandes
@@ -456,7 +457,7 @@ class GridTradingBotFutures:
     
     async def check_position_pnl(self, context=None) -> None:
         try:
-            positions = self.account_service.get_position_api().get_positions().data
+            positions = self.futures_service.get_account_api().get_positions().data
             positions = [p for p in positions if p.symbol == SYMBOL]
             if not position or float(position.available_qty) == 0:
                 return  # Pas de position ouverte
@@ -481,24 +482,57 @@ class GridTradingBotFutures:
         except Exception as e:
             self.logger.error(f"check_position_pnl error: {e}")
 
+    
+    def check_position_pnl(self):
+        try:
+            req = GetPositionListData()
+            positions = self.futures_service.get_account_api().get_positions(req).data
+
+            positions = [p for p in positions if p.symbol == SYMBOL and float(p.unrealised_pnl) != 0]
+
+            for pos in positions:
+                pnl = float(pos.unrealised_pnl)
+                entry_price = float(pos.avg_entry_price)
+                size = float(pos.current_qty)
+                direction = pos.side.lower()
+
+                pnl_pct = pnl / (entry_price * abs(size))
+
+                if direction == "long" and pnl_pct >= TAKE_PROFIT:
+                    self.logger.info(f"💰 TP atteint LONG: {pnl_pct:.2%}, fermeture en cours.")
+                    self.close_position(SYMBOL, "sell", abs(size))
+
+                elif direction == "short" and pnl_pct >= TAKE_PROFIT:
+                    self.logger.info(f"💰 TP atteint SHORT: {pnl_pct:.2%}, fermeture en cours.")
+                    self.close_position(SYMBOL, "buy", abs(size))
+
+                elif pnl_pct <= -STOP_LOSS:
+                    self.logger.info(f"❌ SL atteint {direction.upper()}: {pnl_pct:.2%}, fermeture en cours.")
+                    side = "sell" if direction == "long" else "buy"
+                    self.close_position(SYMBOL, side, abs(size))
+
+        except Exception as e:
+            self.logger.error(f"check_position_pnl error: {e}")
+
+
     def run(self) -> None:
-            jq = self.app.job_queue
-            # Notification de démarrage
-            jq.run_once(self.startup_notify, when=0)
-            if not self.active_orders:
-                # Construction initiale de la grille dès startup
-                jq.run_once(self.adjust_grid, when=1)
-            else:
-                self.logger.info("Ordres rechargés, skip initial grid adjust")
-            # Planification des ajustements périodiques
-            jq.run_repeating(self.adjust_grid, interval=ADJUST_INTERVAL_MIN * 60, first=ADJUST_INTERVAL_MIN * 60)
-            # Monitoring des ordres
-            jq.run_repeating(self.monitor_orders, interval=5, first=10)
-            # Rapport PnL
-            jq.run_repeating(self.pnl_report, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
-            jq.run_repeating(self.check_position_pnl, interval=10, first=15)
-            # Démarrage du bot
-            self.app.run_polling()
+                jq = self.app.job_queue
+                # Notification de démarrage
+                jq.run_once(self.startup_notify, when=0)
+                if not self.active_orders:
+                    # Construction initiale de la grille dès startup
+                    jq.run_once(self.adjust_grid, when=1)
+                else:
+                    self.logger.info("Ordres rechargés, skip initial grid adjust")
+                # Planification des ajustements périodiques
+                jq.run_repeating(self.adjust_grid, interval=ADJUST_INTERVAL_MIN * 60, first=ADJUST_INTERVAL_MIN * 60)
+                # Monitoring des ordres
+                jq.run_repeating(self.monitor_orders, interval=5, first=10)
+                # Rapport PnL
+                jq.run_repeating(self.pnl_report, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
+                jq.run_repeating(self.check_position_pnl, interval=10, first=15)
+                # Démarrage du bot
+                self.app.run_polling()
 
 if __name__ == '__main__':
     GridTradingBotFutures().run()
