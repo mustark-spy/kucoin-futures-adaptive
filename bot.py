@@ -1,4 +1,3 @@
-from kucoin_universal_sdk.generate.futures.account import GetPositionListData
 #!/usr/bin/env python3
 """
 Bot de Trading Telegram Futures ATR avec Persistence, Sandbox, Notifications Enrichies et Commandes
@@ -27,6 +26,8 @@ from kucoin_universal_sdk.generate.futures.order import (
     CancelOrderByIdReqBuilder as FuturesCancelOrderReqBuilder,
     GetOrderByOrderIdReqBuilder as FuturesGetOrderReqBuilder,
 )
+from kucoin_universal_sdk.generate.futures.positions import GetPositionListData
+
 from kucoin_universal_sdk.generate.account.account import GetFuturesAccountReqBuilder
 from kucoin_universal_sdk.generate.service import SpotService, FuturesService, AccountService
 from kucoin_universal_sdk.model import (
