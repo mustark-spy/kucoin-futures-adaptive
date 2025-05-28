@@ -456,7 +456,7 @@ class GridTradingBotFutures:
     
     async def check_position_pnl(self, context=None) -> None:
         try:
-            position = self.futures_service.get_position_api().get_position_by_symbol(SYMBOL)
+            positions = self.account_service.get_account_api().get_futures_positions().data
             if not position or float(position.available_qty) == 0:
                 return  # Pas de position ouverte
 
