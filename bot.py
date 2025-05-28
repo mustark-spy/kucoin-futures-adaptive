@@ -480,24 +480,24 @@ class GridTradingBotFutures:
         except Exception as e:
             self.logger.error(f"check_position_pnl error: {e}")
 
-def run(self) -> None:
-        jq = self.app.job_queue
-        # Notification de démarrage
-        jq.run_once(self.startup_notify, when=0)
-        if not self.active_orders:
-            # Construction initiale de la grille dès startup
-            jq.run_once(self.adjust_grid, when=1)
-        else:
-            self.logger.info("Ordres rechargés, skip initial grid adjust")
-        # Planification des ajustements périodiques
-        jq.run_repeating(self.adjust_grid, interval=ADJUST_INTERVAL_MIN * 60, first=ADJUST_INTERVAL_MIN * 60)
-        # Monitoring des ordres
-        jq.run_repeating(self.monitor_orders, interval=5, first=10)
-        # Rapport PnL
-        jq.run_repeating(self.pnl_report, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
-        jq.run_repeating(self.check_position_pnl, interval=10, first=15)
-        # Démarrage du bot
-        self.app.run_polling()
+    def run(self) -> None:
+            jq = self.app.job_queue
+            # Notification de démarrage
+            jq.run_once(self.startup_notify, when=0)
+            if not self.active_orders:
+                # Construction initiale de la grille dès startup
+                jq.run_once(self.adjust_grid, when=1)
+            else:
+                self.logger.info("Ordres rechargés, skip initial grid adjust")
+            # Planification des ajustements périodiques
+            jq.run_repeating(self.adjust_grid, interval=ADJUST_INTERVAL_MIN * 60, first=ADJUST_INTERVAL_MIN * 60)
+            # Monitoring des ordres
+            jq.run_repeating(self.monitor_orders, interval=5, first=10)
+            # Rapport PnL
+            jq.run_repeating(self.pnl_report, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
+            jq.run_repeating(self.check_position_pnl, interval=10, first=15)
+            # Démarrage du bot
+            self.app.run_polling()
 
 if __name__ == '__main__':
     GridTradingBotFutures().run()
