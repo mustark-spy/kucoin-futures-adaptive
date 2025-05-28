@@ -458,34 +458,6 @@ class GridTradingBotFutures:
     
     async def check_position_pnl(self, context=None) -> None:
         try:
-            positions = self.futures_service.get_account_api().get_positions().data
-            positions = [p for p in positions if p.symbol == SYMBOL]
-            if not position or float(position.available_qty) == 0:
-                return  # Pas de position ouverte
-
-            entry_price = float(position.entry_price)
-            mark_price = float(position.mark_price)
-            size = float(position.available_qty)
-            side = position.side.lower()  # 'long' ou 'short'
-
-            pnl_pct = (mark_price - entry_price) / entry_price if side == 'long' else (entry_price - mark_price) / entry_price
-
-            if pnl_pct >= TAKE_PROFIT:
-                self.logger.info(f"TP atteint {pnl_pct:.2%}, clôture position")
-                self.futures_service.get_order_api().close_position(SYMBOL, "market")
-                await self.app.bot.send_message(chat_id=self.chat_id, text=f"🎯 <b>TP atteint</b>: {pnl_pct:.2%} — Position clôturée", parse_mode="HTML")
-
-            elif pnl_pct <= -STOP_LOSS:
-                self.logger.info(f"SL atteint {pnl_pct:.2%}, clôture position")
-                self.futures_service.get_order_api().close_position(SYMBOL, "market")
-                await self.app.bot.send_message(chat_id=self.chat_id, text=f"🛑 <b>SL atteint</b>: {pnl_pct:.2%} — Position clôturée", parse_mode="HTML")
-
-        except Exception as e:
-            self.logger.error(f"check_position_pnl error: {e}")
-
-    
-    def check_position_pnl(self):
-        try:
             req = GetPositionListData()
             positions = self.futures_service.get_account_api().get_positions(req).data
 
