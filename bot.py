@@ -256,6 +256,7 @@ class GridTradingBotFutures:
             # Long market
             self.futures_service.get_order_api().add_order(
                 FuturesAddOrderReqBuilder()
+                .set_client_oid(str(uuid.uuid4()))
                 .set_symbol(SYMBOL)
                 .set_side("buy")
                 .set_type("market")
@@ -268,6 +269,7 @@ class GridTradingBotFutures:
             # Short market
             self.futures_service.get_order_api().add_order(
                 FuturesAddOrderReqBuilder()
+                .set_client_oid(str(uuid.uuid4()))
                 .set_symbol(SYMBOL)
                 .set_side("sell")
                 .set_type("market")
@@ -418,9 +420,9 @@ class GridTradingBotFutures:
             # --- Annulation de tous les ordres ouverts sur KuCoin ---
             try:
                 req = GetOrderListReqBuilder().set_symbol(SYMBOL).build()
-                open_orders = self.futures_service.get_order_api().get_order_list(req).data
-
-                for order in open_orders:
+                orders_resp = self.futures_service.get_order_api().get_order_list(req)
+                orders = orders_resp.items  # ✅ ou .get_items() selon version
+                for order in orders:
                     if order.status == "open":
                         self.cancel_futures_order(order.id)
                         self.logger.info(f"❌ Ordre annulé : {order.side.upper()} à {order.price}")
