@@ -550,23 +550,32 @@ class GridTradingBotFutures:
         try:
             req = GetPositionListData()
             positions = self.futures_service.get_positions_api().get_position_list(req).data
-            positions = [p for p in positions if p.symbol == SYMBOL and float(p.unrealised_pnl) != 0]
 
-            ##self.logger.info(f"Checking Position Data -> {[p.__dict__ for p in positions]}")
+            # Récupération des anciennes positions (sauvegardées dans state.json)
+            previous_positions = getattr(self, 'last_positions', {})
+            current_positions = {}
 
             for pos in positions:
-                pnl = float(pos.unrealised_pnl)
-                entry_price = float(pos.avg_entry_price)
-                size = float(pos.current_qty)
-                direction = str(pos.position_side.value).lower()
-
-                if size == 0:
+                if pos.symbol != SYMBOL:
                     continue
 
-                pnl_pct = pnl / (entry_price * abs(size))
+                size = float(pos.current_qty)
+                direction = str(pos.position_side.value).lower()
+                entry_price = float(pos.avg_entry_price)
+                pnl = float(pos.unrealised_pnl)
+                pnl_pct = pnl / (entry_price * abs(size)) if entry_price != 0 else 0
 
                 now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+                # --- Notifications ouverture de position ---
+                position_key = f"{direction}_{entry_price:.2f}_{size}"
+                current_positions[position_key] = size
+
+                if position_key not in previous_positions:
+                    msg = f"📈 POSITION OUVERTE ({direction.upper()})\n{size} contrat(s) à {entry_price:.2f} USDT"
+                    await self.send_telegram_message(msg)
+
+                # --- TP / SL ---
                 if direction == "long" or (direction == "both" and size > 0):
                     if pnl_pct >= TAKE_PROFIT:
                         msg = f"💰 TP LONG: +{pnl_pct:.2%}, fermeture {size} contrats."
@@ -595,10 +604,19 @@ class GridTradingBotFutures:
                         self.pnl_history.append({"type": "SL", "side": "SHORT", "pnl_pct": pnl_pct, "timestamp": now})
                         self.close_position(SYMBOL, "buy", abs(size))
 
+            # --- Notifications fermetures ---
+            closed_positions = set(previous_positions) - set(current_positions)
+            for pos_key in closed_positions:
+                await self.send_telegram_message(f"📉 POSITION FERMÉE : {pos_key.replace('_', ' | ')}")
+
+            # Mise à jour des positions sauvegardées
+            self.last_positions = current_positions
+
             self.save_state()
 
         except Exception as e:
             self.logger.error(f"check_position_pnl error: {e}")
+
 
 
     def run(self) -> None:
