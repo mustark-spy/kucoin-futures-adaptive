@@ -502,10 +502,8 @@ class GridTradingBotFutures:
     async def monitor_orders(self, context=None) -> None:
         for order in list(self.active_orders):
             try:
-                req = FuturesGetOrderReqBuilder()\
-                    .set_order_id(order['id'])\
-                    .build()
-                status = self.futures_service.get_order_api().get_order(req)
+                status = self.futures_service.get_order_api().get_order_by_order_id(
+                        FuturesGetOrderReqBuilder().set_order_id(order['id']).build())
 
                 if status.state.lower() == "done":
                     side = order['side']
