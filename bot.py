@@ -101,6 +101,7 @@ class GridTradingBotFutures:
         self.app.add_handler(CommandHandler("pnl", self.cmd_pnl))
         self.app.add_handler(CommandHandler("statut", self.cmd_statut))
         self.app.add_handler(CommandHandler("balance", self.cmd_balance))
+        self.app.add_handler(CommandHandler("position", self.cmd_position))
 
         # KuCoin SDK
         key = os.getenv("KUCOIN_API_KEY", "")
@@ -170,29 +171,62 @@ class GridTradingBotFutures:
             parse_mode='HTML'
         )
 
+    async def send_telegram_message(self, message: str) -> None:
+        try:
+            await self.app.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            self.logger.error(f"Erreur envoi Telegram : {e}")
+
     async def cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.pnl_history:
-            return await update.message.reply_text("Aucun historique PnL disponible.")
-        lines = ["📈 Historique PnL (derniers 5):"]
-        for e in self.pnl_history[-5:]:
-            lines.append(f"{e['time']}: {e['pnl']:+.4f} {BASE_CURRENCY} ({e['pct']:+.2f}%)")
-        await update.message.reply_html("\n".join(lines))
+            await self.send_telegram_message("📉 Aucun trade enregistré pour le moment.")
+            return
 
-    async def cmd_statut(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self.grid_prices:
-            return await update.message.reply_text("Grille non initialisée.")
-        lower, upper = min(self.grid_prices), max(self.grid_prices)
-        spread = upper - lower
-        step = spread / GRID_SIZE
-        lines = [
-            "🔍 Statut Actuel:",
-            f"Niveaux: {len(self.grid_prices)}",
-            f"Range: {lower:.4f} - {upper:.4f}",
-            f"Spread: {spread:.4f}",
-            f"Increment: {step:.4f}",
-            f"Ordres actifs: {len(self.active_orders)}"
-        ]
-        await update.message.reply_html("\n".join(lines))
+        report = "\U0001F4C8 Historique PnL (TP/SL) :\n"
+        for entry in self.pnl_history[-10:]:
+            report += f"{entry['timestamp']} - {entry['type']} {entry['side']} : {entry['pnl_pct']:.2%}\n"
+
+        await self.send_telegram_message(report)
+
+    async def cmd_statut(self, context=None) -> None:
+        try:
+            msg = "\U0001F4DD <b>STATUT ACTUEL</b>\n"
+
+            # --- Dernières positions ouvertes ---
+            req = GetPositionListData()
+            positions = self.futures_service.get_positions_api().get_position_list(req).data
+            open_pos = [p for p in positions if p.symbol == SYMBOL and float(p.current_qty) != 0]
+
+            if open_pos:
+                msg += "\n<b>📌 Positions ouvertes :</b>\n"
+                for p in open_pos:
+                    pnl_pct = float(p.unrealised_pnl) / (float(p.avg_entry_price) * abs(float(p.current_qty)))
+                    msg += f"{p.position_side.value.upper()} {p.current_qty} @ {p.avg_entry_price:.2f} | PnL: {p.unrealised_pnl:.2f} USDT ({pnl_pct:.2%})\n"
+            else:
+                msg += "\n<b>📌 Aucune position ouverte.</b>\n"
+
+            # --- Ordres actifs ---
+            if self.active_orders:
+                msg += "\n<b>📦 Ordres en attente :</b>\n"
+                for o in self.active_orders:
+                    arrow = "⬇️" if o['side'] == "buy" else "⬆️"
+                    msg += f"{arrow} {o['side'].upper()} {o['size']} @ {o['price']:.2f} USDT\n"
+            else:
+                msg += "\n<b>📦 Aucun ordre actif.</b>\n"
+
+            # --- Dernier PnL ---
+            if self.pnl_history:
+                last = self.pnl_history[-1]
+                msg += f"\n<b>Dernier PnL :</b> {last['type']} {last['side']} - {last['pnl_pct']:.2%} ({last['timestamp']})\n"
+
+            await self.send_telegram_message(msg)
+        except Exception as e:
+            self.logger.error(f"cmd_statut error: {e}")
+
 
     async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         bal = float(
@@ -201,6 +235,53 @@ class GridTradingBotFutures:
             .available_balance
         )
         await update.message.reply_text(f"💰 Balance futures: {bal:.4f} {BASE_CURRENCY}")
+
+    async def cmd_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            symbol_info = self.futures_service.get_market_api().get_symbol(
+                GetSymbolReqBuilder().set_symbol(SYMBOL).build()
+            )
+            last_price = float(symbol_info.mark_price)
+            multiplier = float(symbol_info.multiplier)
+            usdt_per = float(BUDGET) / 10  # 10% du budget pour chaque sens
+            btc_amount = usdt_per * float(LEVERAGE) / last_price
+            size_f = btc_amount / multiplier
+            size = math.floor(size_f)
+
+            if size < 1:
+                await self.send_telegram_message("❗ Budget trop faible pour une position de test.")
+                return
+
+            # Long market
+            self.futures_service.get_order_api().add_order(
+                FuturesAddOrderReqBuilder()
+                .set_symbol(SYMBOL)
+                .set_side("buy")
+                .set_order_type("market")
+                .set_size(str(size))
+                .set_leverage(LEVERAGE)
+                .set_remark("forced-position")
+                .build()
+            )
+
+            # Short market
+            self.futures_service.get_order_api().add_order(
+                FuturesAddOrderReqBuilder()
+                .set_symbol(SYMBOL)
+                .set_side("sell")
+                .set_order_type("market")
+                .set_size(str(size))
+                .set_leverage(LEVERAGE)
+                .set_remark("forced-position")
+                .build()
+            )
+
+            await self.send_telegram_message(f"🚀 Position forcée : LONG et SHORT {size} contrats chacun.")
+
+        except Exception as e:
+            self.logger.error(f"cmd_position error: {e}")
+            await self.send_telegram_message(f"❌ Erreur ouverture position : {e}")
+
 
     def get_klines(self) -> List[Dict]:
         """
@@ -224,6 +305,15 @@ class GridTradingBotFutures:
         resp = self.futures_service.get_market_api().get_klines(req)
         return resp.data
 
+    def get_order_status(self, order_id: str) -> str:
+        try:
+            response = self.futures_service.get_order_api().get_order_by_order_id(
+                FuturesGetOrderReqBuilder().set_order_id(order_id).build()
+            )
+            return response.status  # ex : "FILLED", "OPEN", "CANCELLED"
+        except Exception as e:
+            self.logger.error(f"Erreur récupération statut ordre {order_id} : {e}")
+            return "UNKNOWN"
 
     def calculate_atr_bounds(self) -> Tuple[float, float]:
         """
@@ -271,7 +361,7 @@ class GridTradingBotFutures:
 
         return price - atr, price + atr
 
-    def place_futures_order(self, side: MarketSide, price: float, size: float) -> Optional[str]:
+    def place_futures_order(self, side: MarketSide, size: float, price: float) -> Optional[str]:
         """
         Place un ordre futures LIMIT et renvoie l'order_id ou None en cas d'erreur.
         """
@@ -280,7 +370,7 @@ class GridTradingBotFutures:
                 FuturesAddOrderReqBuilder()
                 .set_client_oid(str(uuid.uuid4()))
                 .set_symbol(SYMBOL)
-                .set_side(side.value)         # "buy" ou "sell"
+                .set_side(side)         # "buy" ou "sell"
                 .set_type("limit")            # chaîne "limit"
                 .set_price(str(price))
                 .set_size(size)
@@ -304,185 +394,143 @@ class GridTradingBotFutures:
         except Exception as e:
             self.logger.error(f"cancel_futures_order error: {e}")
 
-    def check_order_filled(self, oid: str) -> bool:
-        try:
-            detail = self.futures_service.get_order_api().get_order_by_order_id(
-                FuturesGetOrderReqBuilder().set_order_id(oid).build()
-            )
-            # récupérer la valeur string de l'enum
-            status = detail.status.value if hasattr(detail.status, "value") else str(detail.status)
-            return status.lower() == "done"
-        except Exception as e:
-            self.logger.error(f"check_order_filled error: {e}")
-            return False
-
     async def adjust_grid(self, context=None) -> None:
-        # --- Fetch tick size & precision pour arrondir les prix ---
-        symbol_info = self.futures_service.get_market_api().get_symbol(
-            GetSymbolReqBuilder().set_symbol(SYMBOL).build()
-        )
-        tick = float(symbol_info.tick_size)
-        multiplier= float(symbol_info.multiplier)       # valeur en BTC d’un contrat (0.001)
-        try:
-            decimals = int(round(-math.log10(tick)))
-        except Exception:
-            decimals = 6
-
-        # --- Annulation des ordres existants ---
-        for o in list(self.active_orders):
-            self.cancel_futures_order(o['id'])
-        self.active_orders.clear()
-
-        # --- Calcul ATR bounds & reconstruction grille ---
-        lower, upper = self.calculate_atr_bounds()
-        self.grid_prices = [lower + i * (upper - lower) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
-
-        # ❇️ BUDGET total à répartir sur tous les ordres (BUY + SELL)
-        total_orders = GRID_SIZE * 2
-        usdt_per     = BUDGET / total_orders       # budget USDT par ordre
-        center       = (lower + upper) / 2         # prix moyen spot/futures
-
-        # 1) calculer la quantité BTC que la marge permet
-        btc_amount = usdt_per * LEVERAGE / center
-        # 2) convertir en nombre de contrats
-        size_f     = btc_amount / multiplier
-        size       = math.floor(size_f)
-
-        if size < 1:
-            self.logger.warning(
-                f"Budget insuffisant pour 1 contrat par ordre "
-                f"(size_f={size_f:.2f} contrats) – skip adjust_grid. "
-                f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
+            # --- Récupération des infos du symbole ---
+            symbol_info = self.futures_service.get_market_api().get_symbol(
+                GetSymbolReqBuilder().set_symbol(SYMBOL).build()
             )
-            return
-        # --- Placement des ordres avec arrondi au tick ---
-        for p in self.grid_prices:
-            buy_price  = round(p / tick) * tick
-            buy_price  = float(f"{buy_price:.{decimals}f}")
-            sell_price = round((p * (1 + TAKE_PROFIT)) / tick) * tick
-            sell_price = float(f"{sell_price:.{decimals}f}")
+            tick = float(symbol_info.tick_size)
+            multiplier = float(symbol_info.multiplier)  # valeur en BTC d’un contrat (ex: 0.001)
 
-            bid = self.place_futures_order(MarketSide.BUY,  buy_price,  size)
-            sid = self.place_futures_order(MarketSide.SELL, sell_price, size)
+            try:
+                decimals = int(round(-math.log10(tick)))
+            except Exception:
+                decimals = 6
 
-            if bid:
-                self.active_orders.append({
-                    'id': bid,
-                    'side': MarketSide.BUY.value,    # stocker la chaîne "buy"
-                    'price': buy_price
-                })
-            if sid:
-                self.active_orders.append({
-                    'id': sid,
-                    'side': MarketSide.SELL.value,   # stocker la chaîne "sell"
-                    'price': sell_price
-                })
+            # --- Annulation des ordres existants ---
+            for o in list(self.active_orders):
+                self.cancel_futures_order(o['id'])
+            self.active_orders.clear()
 
-        self.last_adjust = datetime.utcnow()
-        self.save_state()
+            # --- Calcul des bornes ATR ---
+            lower, upper = self.calculate_atr_bounds()
+            center = (lower + upper) / 2
 
-        # --- Notification Telegram ---
-        msg = (
-            f"🔄 <b>Grid ajustée</b>\n"
-            f"Range: <code>{lower:.4f}</code> - <code>{upper:.4f}</code>\n"
-            f"Levels: <i>{GRID_SIZE}</i>\n"
-            f"Time: <i>{self.last_adjust.strftime('%Y-%m-%d %H:%M:%S UTC')}</i>"
-        )
-        await self.app.bot.send_message(chat_id=self.chat_id, text=msg, parse_mode='HTML')
+            # --- Grilles BUY sous le prix et SELL au-dessus
+            buy_grid = [center - i * (center - lower) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
+            sell_grid = [center + i * (upper - center) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
+
+            self.grid_prices = buy_grid + sell_grid
+
+            # ❇️ Répartition du budget
+            total_orders = GRID_SIZE * 2
+            usdt_per = BUDGET / total_orders
+
+            btc_amount = usdt_per * LEVERAGE / center
+            size_f = btc_amount / multiplier
+            size = math.floor(size_f)
+
+            self.logger.info(f"BTC amount par ordre: {btc_amount:.6f}, Multiplier: {multiplier}, Size float: {size_f}")
+
+            if size < 1:
+                self.logger.warning(
+                    f"Budget insuffisant pour 1 contrat par ordre (size_f={size_f:.2f} contrats) – skip adjust_grid. "
+                    f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
+                )
+                return
+
+            # --- Placement des ordres ---
+            for price in buy_grid:
+                buy_price = round(round(price / tick) * tick, decimals)
+                order_id = self.place_futures_order("buy", size, buy_price)
+                if order_id:
+                    self.active_orders.append({"id": order_id, "side": "buy", "price": buy_price, "size": size})
+
+            for price in sell_grid:
+                sell_price = round(round(price / tick) * tick, decimals)
+                order_id = self.place_futures_order("sell", size, sell_price)
+                if order_id:
+                    self.active_orders.append({"id": order_id, "side": "sell", "price": sell_price, "size": size})
+
+            # --- Sauvegarde de l'état ---
+            self.save_state()
+
+            # --- Message Telegram clair ---
+            message = f"\n\U0001F4CA Nouvelle grille ajustée :\n"
+            for o in self.active_orders:
+                direction = "⬇️ LONG" if o['side'] == "buy" else "⬆️ SHORT"
+                message += f"{direction} {o['size']} contrat(s) à {o['price']:.2f} USDT\n"
+
+            await self.send_telegram_message(message)
+            self.logger.info(f"📊 Grille ajustée: {GRID_SIZE} BUY + {GRID_SIZE} SELL ordres placés.")
 
 
     async def monitor_orders(self, context=None) -> None:
         try:
-            resp = self.futures_service.get_market_api().get_symbol(
-                GetSymbolReqBuilder().set_symbol(SYMBOL).build()
-            )
-            price = float(resp.last_trade_price)
+            filled_orders = []
+            for o in list(self.active_orders):
+                order_id = o['id']
+                status = self.get_order_status(order_id)
+                if status == "FILLED":
+                    filled_orders.append(o)
+                    self.active_orders.remove(o)
+                    await elf.send_telegram_message(f"✅ Ordre exécuté : {o['side'].upper()} {o['size']} @ {o['price']:.2f}")
+            if filled_orders:
+                self.save_state()
         except Exception as e:
             self.logger.error(f"monitor_orders error: {e}")
-            return
-        changed = False
-        for o in list(self.active_orders):
-            oid, side, p = o['id'], o['side'], o['price']
-            if self.check_order_filled(oid):
-                changed = True
-                self.active_orders.remove(o)
-                await self.app.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=f"✔ <b>Order Filled</b> ID: <code>{oid}</code> Side: <b>{side.upper()}</b> @ <code>{p:.4f}</code>",
-                    parse_mode='HTML'
-                )
-            if side == MarketSide.BUY.value and price <= p * (1 - STOP_LOSS):
-                changed = True
-                self.cancel_futures_order(oid)
-                self.active_orders.remove(o)
-                await self.app.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=f"🛑 <b>Stop-Loss</b> BUY @ <code>{p:.4f}</code>",
-                    parse_mode='HTML'
-                )
-            if side == MarketSide.SELL.value and price >= p * (1 + TAKE_PROFIT):
-                changed = True
-                self.cancel_futures_order(oid)
-                self.active_orders.remove(o)
-                await self.app.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=f"🎯 <b>Take-Profit</b> SELL @ <code>{p:.4f}</code>",
-                    parse_mode='HTML'
-                )
-        if changed: self.save_state()
 
-    async def pnl_report(self, context=None) -> None:
-        try:
-            bal = float(
-                self.account_service.get_account_api()
-                .get_futures_account(GetFuturesAccountReqBuilder().set_currency(BASE_CURRENCY).build())
-                .available_balance
-            )
-        except Exception as e:
-            self.logger.error(f"pnl_report error: {e}")
-            return
-        pnl = bal - self.last_balance
-        pct = (pnl / self.last_balance * 100) if self.last_balance else 0
-        entry = {'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M'), 'balance': bal, 'pnl': pnl, 'pct': pct}
-        self.pnl_history.append(entry)
-        self.last_balance = bal
-        self.last_pnl_report = datetime.utcnow()
-        self.save_state()
-        await self.app.bot.send_message(
-            chat_id=self.chat_id,
-            text=(f"📊 <b>PnL Report</b> {entry['time']}:\n"
-                  f"Change: <b>{pnl:+.4f} {BASE_CURRENCY}</b> (<b>{pct:+.2f}%</b>)"),
-            parse_mode='HTML'
-        )
-
-    
+   
     async def check_position_pnl(self, context=None) -> None:
         try:
             req = GetPositionListData()
-            positions = self.futures_service.get_account_api().get_positions(req).data
-
+            positions = self.futures_service.get_positions_api().get_position_list(req).data
             positions = [p for p in positions if p.symbol == SYMBOL and float(p.unrealised_pnl) != 0]
+
+            self.logger.info(f"Checking Position Data -> {[p.__dict__ for p in positions]}")
 
             for pos in positions:
                 pnl = float(pos.unrealised_pnl)
                 entry_price = float(pos.avg_entry_price)
                 size = float(pos.current_qty)
-                direction = pos.side.lower()
+                direction = str(pos.position_side.value).lower()
+
+                if size == 0:
+                    continue
 
                 pnl_pct = pnl / (entry_price * abs(size))
 
-                if direction == "long" and pnl_pct >= TAKE_PROFIT:
-                    self.logger.info(f"💰 TP atteint LONG: {pnl_pct:.2%}, fermeture en cours.")
-                    self.close_position(SYMBOL, "sell", abs(size))
+                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-                elif direction == "short" and pnl_pct >= TAKE_PROFIT:
-                    self.logger.info(f"💰 TP atteint SHORT: {pnl_pct:.2%}, fermeture en cours.")
-                    self.close_position(SYMBOL, "buy", abs(size))
+                if direction == "long" or (direction == "both" and size > 0):
+                    if pnl_pct >= TAKE_PROFIT:
+                        msg = f"💰 TP LONG: +{pnl_pct:.2%}, fermeture {size} contrats."
+                        self.logger.info(msg)
+                        await self.send_telegram_message(msg)
+                        self.pnl_history.append({"type": "TP", "side": "LONG", "pnl_pct": pnl_pct, "timestamp": now})
+                        self.close_position(SYMBOL, "sell", abs(size))
+                    elif pnl_pct <= -STOP_LOSS:
+                        msg = f"❌ SL LONG: {pnl_pct:.2%}, fermeture {size} contrats."
+                        self.logger.info(msg)
+                        await self.send_telegram_message(msg)
+                        self.pnl_history.append({"type": "SL", "side": "LONG", "pnl_pct": pnl_pct, "timestamp": now})
+                        self.close_position(SYMBOL, "sell", abs(size))
 
-                elif pnl_pct <= -STOP_LOSS:
-                    self.logger.info(f"❌ SL atteint {direction.upper()}: {pnl_pct:.2%}, fermeture en cours.")
-                    side = "sell" if direction == "long" else "buy"
-                    self.close_position(SYMBOL, side, abs(size))
+                elif direction == "short" or (direction == "both" and size < 0):
+                    if pnl_pct >= TAKE_PROFIT:
+                        msg = f"💰 TP SHORT: +{pnl_pct:.2%}, fermeture {abs(size)} contrats."
+                        self.logger.info(msg)
+                        await self.send_telegram_message(msg)
+                        self.pnl_history.append({"type": "TP", "side": "SHORT", "pnl_pct": pnl_pct, "timestamp": now})
+                        self.close_position(SYMBOL, "buy", abs(size))
+                    elif pnl_pct <= -STOP_LOSS:
+                        msg = f"❌ SL SHORT: {pnl_pct:.2%}, fermeture {abs(size)} contrats."
+                        self.logger.info(msg)
+                        await self.send_telegram_message(msg)
+                        self.pnl_history.append({"type": "SL", "side": "SHORT", "pnl_pct": pnl_pct, "timestamp": now})
+                        self.close_position(SYMBOL, "buy", abs(size))
+
+            self.save_state()
 
         except Exception as e:
             self.logger.error(f"check_position_pnl error: {e}")
@@ -492,17 +540,18 @@ class GridTradingBotFutures:
                 jq = self.app.job_queue
                 # Notification de démarrage
                 jq.run_once(self.startup_notify, when=0)
+                self.logger.info(f"Active orders on startup: {self.active_orders}")
                 if not self.active_orders:
                     # Construction initiale de la grille dès startup
                     jq.run_once(self.adjust_grid, when=1)
                 else:
-                    self.logger.info("Ordres rechargés, skip initial grid adjust")
+                    self.logger.info("Ordres rechargés, skip initial grid adjustment")
                 # Planification des ajustements périodiques
                 jq.run_repeating(self.adjust_grid, interval=ADJUST_INTERVAL_MIN * 60, first=ADJUST_INTERVAL_MIN * 60)
                 # Monitoring des ordres
                 jq.run_repeating(self.monitor_orders, interval=5, first=10)
                 # Rapport PnL
-                jq.run_repeating(self.pnl_report, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
+                jq.run_repeating(self.cmd_pnl, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
                 jq.run_repeating(self.check_position_pnl, interval=10, first=15)
                 # Démarrage du bot
                 self.app.run_polling()
