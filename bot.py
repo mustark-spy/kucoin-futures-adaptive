@@ -400,6 +400,7 @@ class GridTradingBotFutures:
         except Exception as e:
             self.logger.error(f"cancel_futures_order error: {e}")
 
+
     async def adjust_grid(self, context=None) -> None:
             # --- Récupération des infos du symbole ---
             symbol_info = self.futures_service.get_market_api().get_symbol(
@@ -413,10 +414,21 @@ class GridTradingBotFutures:
             except Exception:
                 decimals = 6
 
-            # --- Annulation des ordres existants ---
-            for o in list(self.active_orders):
-                self.cancel_futures_order(o['id'])
+            # --- Annulation de tous les ordres ouverts sur KuCoin ---
+            try:
+                open_orders = self.futures_service.get_order_api().get_order_list().data
+                for order in open_orders:
+                    if order.symbol == SYMBOL and order.status == "open":
+                        self.cancel_futures_order(order.id)
+                        self.logger.info(f"❌ Ordre annulé : {order.side.upper()} à {order.price}")
+            except Exception as e:
+                self.logger.error(f"Erreur lors de l’annulation des ordres ouverts : {e}")
+
+            # Réinitialisation de l’état local
             self.active_orders.clear()
+            self.grid_prices.clear()
+
+            await self.send_telegram_message("📛 Tous les ordres ouverts ont été annulés pour réinitialisation de la grille.")
 
             # --- Calcul des bornes ATR ---
             lower, upper = self.calculate_atr_bounds()
@@ -480,7 +492,7 @@ class GridTradingBotFutures:
                 if status == "FILLED":
                     filled_orders.append(o)
                     self.active_orders.remove(o)
-                    await elf.send_telegram_message(f"✅ Ordre exécuté : {o['side'].upper()} {o['size']} @ {o['price']:.2f}")
+                    await self.send_telegram_message(f"✅ Ordre exécuté : {o['side'].upper()} {o['size']} @ {o['price']:.2f}")
             if filled_orders:
                 self.save_state()
         except Exception as e:
