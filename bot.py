@@ -378,8 +378,9 @@ class GridTradingBotFutures:
                 .set_remark("atr-grid")
                 .build()
             )
-            if order_id:
-                self.logger.info(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats. ID: {order_id}")
+            if order.order_id:
+                self.logger.info(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats. ID: {order.order_id}")
+                self.send_telegram_message(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats. ID: {order.order_id}")
                 return order.order_id
             else:
                 self.logger.error(f"❌ Réponse inattendue: {result}")
