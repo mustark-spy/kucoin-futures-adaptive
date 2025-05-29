@@ -502,24 +502,50 @@ class GridTradingBotFutures:
     async def monitor_orders(self, context=None) -> None:
         for order in list(self.active_orders):
             try:
-                status = self.futures_service.get_order_api().get_order_by_order_id(
-                        FuturesGetOrderReqBuilder().set_order_id(order['id']).build())
+                # Récupération des infos de l’ordre
+                resp = self.futures_service.get_order_api().get_order_by_order_id(
+                    FuturesGetOrderReqBuilder().set_order_id(order['id']).build()
+                )
 
-                if status.state.lower() == "done":
-                    side = order['side']
-                    price = float(order['price'])
-                    size = int(order['size'])
+                # Log de débogage pour inspecter la réponse
+                self.logger.debug(f"[DEBUG] Détails ordre {order['id']} : {resp.__dict__}")
 
-                    asyncio.create_task(self.send_telegram_message(
+                # Récupère proprement le statut
+                order_state = getattr(resp, 'order_state', None)
+
+                if not order_state:
+                    continue  # Si pas d'état retourné, on ignore
+
+                side = order.get('side', 'unknown')
+                price = float(order.get('price', 0.0))
+                size = int(order.get('size', 0))
+
+                if order_state.lower() == "done":
+                    # ✅ Ordre exécuté avec succès
+                    await self.send_telegram_message(
                         f"✅ ORDRE EXÉCUTÉ\n{side.upper()} {size} contrat(s) à {price:.2f} USDT"
-                    ))
+                    )
+                    self.active_orders.remove(order)
+
+                elif order_state.lower() == "cancelled":
+                    # ❌ Ordre annulé
+                    await self.send_telegram_message(
+                        f"❌ ORDRE ANNULÉ\n{side.upper()} {size} contrat(s) à {price:.2f} USDT"
+                    )
+                    self.active_orders.remove(order)
+
+                elif order_state.lower() in ["fail", "rejected"]:
+                    # ⚠️ Échec ou rejet de l’ordre
+                    await self.send_telegram_message(
+                        f"⚠️ ORDRE ÉCHOUÉ\n{side.upper()} {size} contrat(s) à {price:.2f} USDT"
+                    )
                     self.active_orders.remove(order)
 
             except Exception as e:
                 self.logger.error(f"Erreur surveillance ordre {order['id']} : {e}")
 
 
-   
+
     async def check_position_pnl(self, context=None) -> None:
         try:
             req = GetPositionListData()
