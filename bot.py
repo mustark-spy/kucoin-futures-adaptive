@@ -378,7 +378,12 @@ class GridTradingBotFutures:
                 .set_remark("atr-grid")
                 .build()
             )
-            return order.order_id
+            if order_id:
+                self.logger.info(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats. ID: {order_id}")
+                return order.order_id
+            else:
+                self.logger.error(f"❌ Réponse inattendue: {result}")
+                return None
         except Exception as e:
             self.logger.error(f"place_futures_order error: {e}")
             return None
