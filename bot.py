@@ -499,11 +499,11 @@ class GridTradingBotFutures:
             if trend == "up":
                 # SELL GRID uniquement
                 prices = [center + i * (upper - center) / grid_range for i in range(1, grid_range + 1)]
-                active_side = "sell"
+                active_side = "buy"
             elif trend == "down":
                 # BUY GRID uniquement
                 prices = [center - i * (center - lower) / grid_range for i in range(1, grid_range + 1)]
-                active_side = "buy"
+                active_side = "sell"
             else:
                 # Neutralité : dernière tendance prioritaire, par défaut BUY
                 prices = [center - i * (center - lower) / grid_range for i in range(1, grid_range + 1)]
