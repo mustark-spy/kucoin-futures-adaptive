@@ -26,6 +26,7 @@ from kucoin_universal_sdk.generate.futures.order import (
     CancelOrderByIdReqBuilder as FuturesCancelOrderReqBuilder,
     GetOrderByOrderIdReqBuilder as FuturesGetOrderReqBuilder,
 )
+from kucoin_universal_sdk.generate.futures.order import GetOrderListReqBuilder
 from kucoin_universal_sdk.generate.futures.positions import GetPositionListData
 
 from kucoin_universal_sdk.generate.account.account import GetFuturesAccountReqBuilder
@@ -192,7 +193,7 @@ class GridTradingBotFutures:
 
         await self.send_telegram_message(report)
 
-    async def cmd_statut(self, context=None) -> None:
+    async def cmd_statut(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             msg = "\U0001F4DD <b>STATUT ACTUEL</b>\n"
 
@@ -415,10 +416,12 @@ class GridTradingBotFutures:
                 decimals = 6
 
             # --- Annulation de tous les ordres ouverts sur KuCoin ---
-            try:
-                open_orders = self.futures_service.get_order_api().get_order_list().data
+           try:
+                req = GetOrderListReqBuilder().set_symbol(SYMBOL).build()
+                open_orders = self.futures_service.get_order_api().get_order_list(req).data
+
                 for order in open_orders:
-                    if order.symbol == SYMBOL and order.status == "open":
+                    if order.status == "open":
                         self.cancel_futures_order(order.id)
                         self.logger.info(f"❌ Ordre annulé : {order.side.upper()} à {order.price}")
             except Exception as e:
