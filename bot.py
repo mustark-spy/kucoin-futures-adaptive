@@ -103,6 +103,8 @@ class GridTradingBotFutures:
         self.app.add_handler(CommandHandler("statut", self.cmd_statut))
         self.app.add_handler(CommandHandler("balance", self.cmd_balance))
         self.app.add_handler(CommandHandler("position", self.cmd_position))
+        self.app.add_handler(CommandHandler("build", self.cmd_build))
+
 
         # KuCoin SDK
         key = os.getenv("KUCOIN_API_KEY", "")
@@ -286,6 +288,22 @@ class GridTradingBotFutures:
             await self.send_telegram_message(f"❌ Erreur ouverture position : {e}")
 
 
+    async def cmd_build(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            await update.message.reply_text("🔧 Reconstruction manuelle de la grille en cours...")
+            
+            # 1. Annule tous les ordres ouverts
+            self.cancel_all_open_orders()
+
+            # 2. Recalcule et place une nouvelle grille
+            await self.adjust_grid()
+
+            await update.message.reply_text("✅ Nouvelle grille construite avec succès.")
+        except Exception as e:
+            self.logger.error(f"Erreur cmd_build : {e}")
+            await update.message.reply_text(f"❌ Erreur lors de la reconstruction : {e}")
+
+
     def get_klines(self) -> List[Dict]:
         """
         Récupère les bougies horaires pour le contrat futures (SPOT_SYMBOL n'est plus utilisé).
@@ -393,13 +411,15 @@ class GridTradingBotFutures:
             return None
 
     def cancel_all_open_orders(self):
+        """
+        Annule tous les ordres ouverts pour le symbole défini.
+        """
         try:
-            req = GetOrderListReqBuilder()\
-                .set_symbol(SYMBOL)\
-                .set_status("active")\
-                .build()
-            open_orders = self.futures_service.get_order_api().get_order_list(req).items
-
+            req = GetOrderListReqBuilder().set_symbol(SYMBOL).set_status("open").build()
+            response = self.futures_service.get_order_api().get_order_list(req)
+            
+            open_orders = getattr(response, "items", None) or getattr(response, "data", [])
+            
             if not open_orders:
                 self.logger.info("Aucun ordre ouvert à annuler.")
                 return
@@ -407,11 +427,14 @@ class GridTradingBotFutures:
             for order in open_orders:
                 try:
                     self.cancel_futures_order(order.order_id)
+                    self.logger.info(f"✅ Ordre annulé : {order.order_id}")
                 except Exception as e:
                     self.logger.error(f"Erreur annulation ordre {order.order_id} : {e}")
-            self.logger.info(f"{len(open_orders)} ordres ouverts annulés.")
+
+            self.logger.info(f"✅ {len(open_orders)} ordres annulés.")
         except Exception as e:
-            self.logger.error
+            self.logger.error(f"cancel_all_open_orders error: {e}")
+
 
     def cancel_futures_order(self, oid: str) -> None:
         """
@@ -426,77 +449,103 @@ class GridTradingBotFutures:
 
 
     async def adjust_grid(self, context=None) -> None:
+        try:
+            # --- Détection de tendance via EMA courte / longue ---
+            klines = self.futures_service.get_market_api().get_klines(
+                GetKlinesReqBuilder().set_symbol(SYMBOL).set_granularity(5).set_limit(50).build()
+            ).items
+
+            closes = [float(k.close_price) for k in klines]
+            ema_fast = sum(closes[-5:]) / 5
+            ema_slow = sum(closes[-20:]) / 20
+
+            if ema_fast > ema_slow:
+                trend = "up"
+            elif ema_fast < ema_slow:
+                trend = "down"
+            else:
+                trend = "neutral"
+
+            self.logger.info(f"📈 Tendance détectée : {trend.upper()} (EMA5={ema_fast:.2f}, EMA20={ema_slow:.2f})")
+
+            # --- Vérifie si tendance inversée par rapport à précédente ---
+            previous_trend = getattr(self, 'last_trend', None)
+            if previous_trend and trend != previous_trend:
+                await self.send_telegram_message(f"🔁 Tendance inversée : {previous_trend.upper()} → {trend.upper()}\nRéinitialisation de la grille en cours...")
+            self.last_trend = trend
+
             # --- Récupération des infos du symbole ---
             symbol_info = self.futures_service.get_market_api().get_symbol(
                 GetSymbolReqBuilder().set_symbol(SYMBOL).build()
             )
             tick = float(symbol_info.tick_size)
-            multiplier = float(symbol_info.multiplier)  # valeur en BTC d’un contrat (ex: 0.001)
+            multiplier = float(symbol_info.multiplier)
 
             try:
                 decimals = int(round(-math.log10(tick)))
             except Exception:
                 decimals = 6
 
-            # --- Annulation de tous les ordres ouverts sur KuCoin ---
+            # --- Annulation des anciens ordres ---
             self.cancel_all_open_orders()
-            # Réinitialisation de l’état local
             self.active_orders.clear()
-            self.grid_prices.clear()
-
-            await self.send_telegram_message("📛 Tous les ordres ouverts ont été annulés pour réinitialisation de la grille.")
 
             # --- Calcul des bornes ATR ---
             lower, upper = self.calculate_atr_bounds()
             center = (lower + upper) / 2
 
-            # --- Grilles BUY sous le prix et SELL au-dessus
-            buy_grid = [center - i * (center - lower) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
-            sell_grid = [center + i * (upper - center) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
+            grid_range = GRID_SIZE
+            prices = []
 
-            self.grid_prices = buy_grid + sell_grid
+            if trend == "up":
+                # SELL GRID uniquement
+                prices = [center + i * (upper - center) / grid_range for i in range(1, grid_range + 1)]
+                active_side = "sell"
+            elif trend == "down":
+                # BUY GRID uniquement
+                prices = [center - i * (center - lower) / grid_range for i in range(1, grid_range + 1)]
+                active_side = "buy"
+            else:
+                # Neutralité : dernière tendance prioritaire, par défaut BUY
+                prices = [center - i * (center - lower) / grid_range for i in range(1, grid_range + 1)]
+                active_side = "buy"
 
-            # ❇️ Répartition du budget
-            total_orders = GRID_SIZE * 2
-            usdt_per = BUDGET / total_orders
-
+            # Répartition du budget
+            usdt_per = BUDGET / GRID_SIZE
             btc_amount = usdt_per * LEVERAGE / center
             size_f = btc_amount / multiplier
             size = math.floor(size_f)
 
-            self.logger.info(f"BTC amount par ordre: {btc_amount:.6f}, Multiplier: {multiplier}, Size float: {size_f}")
-
             if size < 1:
-                self.logger.warning(
-                    f"Budget insuffisant pour 1 contrat par ordre (size_f={size_f:.2f} contrats) – skip adjust_grid. "
-                    f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
-                )
+                self.logger.warning(f"Budget insuffisant pour {active_side} (size_f={size_f:.2f})")
                 return
 
-            # --- Placement des ordres ---
-            for price in buy_grid:
-                buy_price = round(round(price / tick) * tick, decimals)
-                order_id = self.place_futures_order("buy", size, buy_price)
-                if order_id:
-                    self.active_orders.append({"id": order_id, "side": "buy", "price": buy_price, "size": size})
+            self.grid_prices = []
 
-            for price in sell_grid:
-                sell_price = round(round(price / tick) * tick, decimals)
-                order_id = self.place_futures_order("sell", size, sell_price)
+            for price in prices:
+                grid_price = round(price / tick) * tick
+                order_id = self.place_futures_order(active_side, size, grid_price)
                 if order_id:
-                    self.active_orders.append({"id": order_id, "side": "sell", "price": sell_price, "size": size})
+                    self.active_orders.append({
+                        "id": order_id,
+                        "side": active_side,
+                        "price": grid_price,
+                        "size": size
+                    })
+                    self.grid_prices.append(grid_price)
 
-            # --- Sauvegarde de l'état ---
+            # Message Telegram de récapitulatif
+            msg = f"\n⚙️ Nouvelle grille {trend.upper()} :\n"
+            for o in self.active_orders:
+                dir_emoji = "⬇️" if o['side'] == "buy" else "⬆️"
+                msg += f"{dir_emoji} {o['side'].upper()} {o['size']} contrat(s) à {o['price']:.2f} USDT\n"
+            await self.send_telegram_message(msg)
+
+            self.logger.info(f"📊 Grille {trend} placée : {len(self.active_orders)} ordres {active_side}.")
             self.save_state()
 
-            # --- Message Telegram clair ---
-            message = f"\n\U0001F4CA Nouvelle grille ajustée :\n"
-            for o in self.active_orders:
-                direction = "⬇️ LONG" if o['side'] == "buy" else "⬆️ SHORT"
-                message += f"{direction} {o['size']} contrat(s) à {o['price']:.2f} USDT\n"
-
-            await self.send_telegram_message(message)
-            self.logger.info(f"📊 Grille ajustée: {GRID_SIZE} BUY + {GRID_SIZE} SELL ordres placés.")
+        except Exception as e:
+            self.logger.error(f"adjust_grid error: {e}")
 
 
     async def monitor_orders(self, context=None) -> None:
