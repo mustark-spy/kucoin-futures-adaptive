@@ -392,6 +392,27 @@ class GridTradingBotFutures:
             self.logger.error(f"place_futures_order error: {e}")
             return None
 
+    def cancel_all_open_orders(self):
+        try:
+            req = GetOrderListReqBuilder()\
+                .set_symbol(SYMBOL)\
+                .set_status("active")\
+                .build()
+            open_orders = self.futures_service.get_order_api().get_order_list(req).items
+
+            if not open_orders:
+                self.logger.info("Aucun ordre ouvert à annuler.")
+                return
+
+            for order in open_orders:
+                try:
+                    self.cancel_futures_order(order.order_id)
+                except Exception as e:
+                    self.logger.error(f"Erreur annulation ordre {order.order_id} : {e}")
+            self.logger.info(f"{len(open_orders)} ordres ouverts annulés.")
+        except Exception as e:
+            self.logger.error
+
     def cancel_futures_order(self, oid: str) -> None:
         """
         Annule l'ordre futures correspondant à order_id.
@@ -418,17 +439,7 @@ class GridTradingBotFutures:
                 decimals = 6
 
             # --- Annulation de tous les ordres ouverts sur KuCoin ---
-            try:
-                req = GetOrderListReqBuilder().set_symbol(SYMBOL).build()
-                orders_resp = self.futures_service.get_order_api().get_order_list(req)
-                orders = orders_resp.items  # ✅ ou .get_items() selon version
-                for order in orders:
-                    if order.status == "open":
-                        self.cancel_futures_order(order.id)
-                        self.logger.info(f"❌ Ordre annulé : {order.side.upper()} à {order.price}")
-            except Exception as e:
-                self.logger.error(f"Erreur lors de l’annulation des ordres ouverts : {e}")
-
+            self.cancel_all_open_orders()
             # Réinitialisation de l’état local
             self.active_orders.clear()
             self.grid_prices.clear()
@@ -489,19 +500,26 @@ class GridTradingBotFutures:
 
 
     async def monitor_orders(self, context=None) -> None:
-        try:
-            filled_orders = []
-            for o in list(self.active_orders):
-                order_id = o['id']
-                status = self.get_order_status(order_id)
-                if status == "FILLED":
-                    filled_orders.append(o)
-                    self.active_orders.remove(o)
-                    await self.send_telegram_message(f"✅ Ordre exécuté : {o['side'].upper()} {o['size']} @ {o['price']:.2f}")
-            if filled_orders:
-                self.save_state()
-        except Exception as e:
-            self.logger.error(f"monitor_orders error: {e}")
+        for order in list(self.active_orders):
+            try:
+                req = FuturesGetOrderReqBuilder()\
+                    .set_order_id(order['id'])\
+                    .build()
+                status = self.futures_service.get_order_api().get_order(req)
+
+                if status.state.lower() == "done":
+                    side = order['side']
+                    price = float(order['price'])
+                    size = int(order['size'])
+
+                    asyncio.create_task(self.send_telegram_message(
+                        f"✅ ORDRE EXÉCUTÉ\n{side.upper()} {size} contrat(s) à {price:.2f} USDT"
+                    ))
+                    self.active_orders.remove(order)
+
+            except Exception as e:
+                self.logger.error(f"Erreur surveillance ordre {order['id']} : {e}")
+
 
    
     async def check_position_pnl(self, context=None) -> None:
@@ -510,7 +528,7 @@ class GridTradingBotFutures:
             positions = self.futures_service.get_positions_api().get_position_list(req).data
             positions = [p for p in positions if p.symbol == SYMBOL and float(p.unrealised_pnl) != 0]
 
-            self.logger.info(f"Checking Position Data -> {[p.__dict__ for p in positions]}")
+            ##self.logger.info(f"Checking Position Data -> {[p.__dict__ for p in positions]}")
 
             for pos in positions:
                 pnl = float(pos.unrealised_pnl)
