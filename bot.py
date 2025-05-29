@@ -401,7 +401,7 @@ class GridTradingBotFutures:
             )
             if order.order_id:
                 self.logger.info(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats. ID: {order.order_id}")
-                self.send_telegram_message(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats. ID: {order.order_id}")
+                await self.send_telegram_message(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats. ID: {order.order_id}")
                 return order.order_id
             else:
                 self.logger.error(f"❌ Réponse inattendue: {result}")
@@ -415,7 +415,7 @@ class GridTradingBotFutures:
         Annule tous les ordres ouverts pour le symbole défini.
         """
         try:
-            req = GetOrderListReqBuilder().set_symbol(SYMBOL).set_status("open").build()
+            req = GetOrderListReqBuilder().set_symbol(SYMBOL).set_status("active").build()
             response = self.futures_service.get_order_api().get_order_list(req)
             
             open_orders = getattr(response, "items", None) or getattr(response, "data", [])
@@ -476,6 +476,7 @@ class GridTradingBotFutures:
                 GetSymbolReqBuilder().set_symbol(SYMBOL).build()
             )
             tick = float(symbol_info.tick_size)
+            tick_dec = Decimal(str(tick))
             multiplier = float(symbol_info.multiplier)
 
             try:
@@ -520,7 +521,8 @@ class GridTradingBotFutures:
             self.grid_prices = []
 
             for price in prices:
-                grid_price = round(price / tick) * tick
+                grid_price = (Decimal(str(price)) / tick_dec).quantize(Decimal('1'), rounding=ROUND_DOWN) * tick_dec
+                grid_price = float(grid_price)
                 order_id = self.place_futures_order(active_side, size, grid_price)
                 if order_id:
                     self.active_orders.append({
