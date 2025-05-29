@@ -306,7 +306,7 @@ class GridTradingBotFutures:
 
     def get_klines(self) -> List[Dict]:
         """
-        Récupère les bougies horaires pour le contrat futures (SPOT_SYMBOL n'est plus utilisé).
+        Récupère les bougies horaires pour le contrat futures.
         """
         self.logger.info(f"Fetching {ATR_PERIOD+1} futures klines for {SYMBOL} (1h)")
         builder = (
@@ -451,11 +451,8 @@ class GridTradingBotFutures:
     async def adjust_grid(self, context=None) -> None:
         try:
             # --- Détection de tendance via EMA courte / longue ---
-            klines = self.futures_service.get_market_api().get_klines(
-                FuturesKlinesReqBuilder().set_symbol(SYMBOL).set_granularity(5).set_limit(50).build()
-            ).items
-
-            closes = [float(k.close_price) for k in klines]
+            klines = self.get_klines()
+            closes = [float(kline[2]) for kline in klines]  # prix de clôture
             ema_fast = sum(closes[-5:]) / 5
             ema_slow = sum(closes[-20:]) / 20
 
