@@ -452,7 +452,7 @@ class GridTradingBotFutures:
         try:
             # --- Détection de tendance via EMA courte / longue ---
             klines = self.futures_service.get_market_api().get_klines(
-                GetKlinesReqBuilder().set_symbol(SYMBOL).set_granularity(5).set_limit(50).build()
+                FuturesKlinesReqBuilder().set_symbol(SYMBOL).set_granularity(5).set_limit(50).build()
             ).items
 
             closes = [float(k.close_price) for k in klines]
