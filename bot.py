@@ -11,10 +11,10 @@ import logging
 import uuid
 import json
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_DOWN
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+from decimal import Decimal, ROUND_DOWN
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -427,10 +427,10 @@ class GridTradingBotFutures:
 
             for order in open_orders:
                 try:
-                    self.cancel_futures_order(order.order_id)
-                    self.logger.info(f"✅ Ordre annulé : {order.order_id}")
+                    self.cancel_futures_order(order.id)
+                    self.logger.info(f"✅ Ordre annulé : {order.id}")
                 except Exception as e:
-                    self.logger.error(f"Erreur annulation ordre {order.order_id} : {e}")
+                    self.logger.error(f"Erreur annulation ordre {order.id} : {e}")
 
             self.logger.info(f"✅ {len(open_orders)} ordres annulés.")
         except Exception as e:
