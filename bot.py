@@ -416,7 +416,7 @@ class GridTradingBotFutures:
                 decimals = 6
 
             # --- Annulation de tous les ordres ouverts sur KuCoin ---
-           try:
+            try:
                 req = GetOrderListReqBuilder().set_symbol(SYMBOL).build()
                 open_orders = self.futures_service.get_order_api().get_order_list(req).data
 
