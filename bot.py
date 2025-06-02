@@ -248,7 +248,7 @@ class GridTradingBotFutures:
             )
             last_price = float(symbol_info.mark_price)
             multiplier = float(symbol_info.multiplier)
-            usdt_per = float(BUDGET) / 10  # 10% du budget pour chaque sens
+            usdt_per = float(BUDGET/2) / 10  # 10% du budget pour chaque sens
             btc_amount = usdt_per * float(LEVERAGE) / last_price
             size_f = btc_amount / multiplier
             size = math.floor(size_f)
@@ -278,7 +278,6 @@ class GridTradingBotFutures:
                     return None
             except Exception as e:
                 self.logger.error(f"Erreur de placement ORDRE LONG: {e}")
-                return None
 
             try:
                 order = self.futures_service.get_order_api().add_order(
@@ -301,7 +300,6 @@ class GridTradingBotFutures:
                     return None
             except Exception as e:
                 self.logger.error(f"Erreur de placement ORDRE SHORT: {e}")
-                return None
 
             await self.send_telegram_message(f"🚀 Position forcée : LONG et SHORT {size} contrats chacun.")
 
@@ -330,14 +328,14 @@ class GridTradingBotFutures:
             await update.message.reply_text(f"❌ Erreur lors de la reconstruction : {e}")
 
 
-    def get_klines(self) -> List[Dict]:
+    def get_klines(self, symbol: str) -> List[Dict]:
         """
         Récupère les bougies horaires pour le contrat futures.
         """
-        self.logger.info(f"Fetching {ATR_PERIOD+1} futures klines for {SYMBOL_LONG} (1h)")
+        self.logger.info(f"Fetching {ATR_PERIOD+1} futures klines for {symbol} (1h)")
         builder = (
             FuturesKlinesReqBuilder()
-            .set_symbol(SYMBOL_LONG)
+            .set_symbol(symbol)
             .set_granularity(60)           # 1h = 60 minutes
         )
         try:
@@ -362,7 +360,7 @@ class GridTradingBotFutures:
             self.logger.error(f"Erreur récupération statut ordre {order_id} : {e}")
             return "UNKNOWN"
 
-    def calculate_atr_bounds(self) -> Tuple[float, float]:
+    def calculate_atr_bounds(self, symbol: str) -> Tuple[float, float]:
         """
         Calcule les bornes [lower, upper] = price ± ATR directement sur le marché futures.
         """
@@ -370,7 +368,7 @@ class GridTradingBotFutures:
         # le endpoint GET /api/v1/kline/query supporte granularity=60 (1 h)
         builder = (
             FuturesKlinesReqBuilder()
-            .set_symbol(SYMBOL_LONG)
+            .set_symbol(symbol)
             .set_granularity(60)      # 1h = 60 minutes
         )
         # optionnel : définir from/to ; si votre SDK le supporte, sinon on prend le défaut
@@ -402,7 +400,7 @@ class GridTradingBotFutures:
 
         # 3) on récupère le dernier prix futures
         symbol_info = self.futures_service.get_market_api().get_symbol(
-            GetSymbolReqBuilder().set_symbol(SYMBOL_LONG).build()
+            GetSymbolReqBuilder().set_symbol(symbol).build()
         )
         price = float(symbol_info.last_trade_price)
 
@@ -475,18 +473,6 @@ class GridTradingBotFutures:
 
 
     async def adjust_grid(self, context=None) -> None:
-        # --- Récupération des infos du symbole ---
-        symbol_info = self.futures_service.get_market_api().get_symbol(
-            GetSymbolReqBuilder().set_symbol(SYMBOL_LONG).build()
-        )
-        tick = float(symbol_info.tick_size)
-        multiplier = float(symbol_info.multiplier)  # valeur en BTC d’un contrat (ex: 0.001)
-
-        try:
-            decimals = int(round(-math.log10(tick)))
-        except Exception:
-            decimals = 6
-
         # --- Annulation de tous les ordres ouverts sur KuCoin ---
         self.cancel_all_open_orders(SYMBOL_LONG)
         self.cancel_all_open_orders(SYMBOL_SHORT)
@@ -496,13 +482,38 @@ class GridTradingBotFutures:
 
         await self.send_telegram_message("📛 Tous les ordres ouverts ont été annulés pour réinitialisation de la grille.")
 
-        # --- Calcul des bornes ATR ---
-        lower, upper = self.calculate_atr_bounds()
-        center = (lower + upper) / 2
+        # --- Récupération des infos du symbole LONG ---
+        symbol_long_info = self.futures_service.get_market_api().get_symbol(
+            GetSymbolReqBuilder().set_symbol(SYMBOL_LONG).build()
+        )
+        tick_long = float(symbol_long_info.tick_size)
+        multiplier_long = float(symbol_long_info.multiplier)  # valeur en BTC d’un contrat (ex: 0.001)
+
+        # --- Récupération des infos du symbole SHORT ---
+        symbol_short_info = self.futures_service.get_market_api().get_symbol(
+            GetSymbolReqBuilder().set_symbol(SYMBOL_SHORT).build()
+        )
+        tick_short = float(symbol_short_info.tick_size)
+        multiplier_short = float(symbol_short_info.multiplier)  # valeur en BTC d’un contrat (ex: 0.001)
+
+        try:
+            decimals_long = int(round(-math.log10(tick_long)))
+            decimals_short = int(round(-math.log10(tick_short)))
+        except Exception:
+            decimals_long = 6
+            decimals_short = 6
+
+        # --- Calcul des bornes ATR LONG ---
+        lower_long, upper_long = self.calculate_atr_bounds(SYMBOL_LONG)
+        center_long = (lower_long + upper_long) / 2
+
+        # --- Calcul des bornes ATR SHORT ---
+        lower_short, upper_short = self.calculate_atr_bounds(SYMBOL_SHORT)
+        center_short = (lower_long + upper_long) / 2
 
         # --- Grilles BUY sous le prix et SELL au-dessus
-        buy_grid = [center - i * (center - lower) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
-        sell_grid = [center + i * (upper - center) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
+        buy_grid = [center_long - i * (center_long - lower_long) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
+        sell_grid = [center_short + i * (upper_short - center_short) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
 
         self.grid_prices = buy_grid + sell_grid
 
@@ -510,31 +521,42 @@ class GridTradingBotFutures:
         total_orders = GRID_SIZE * 2
         usdt_per = (BUDGET / 2) / GRID_SIZE
 
-        btc_amount = usdt_per * LEVERAGE / center
-        size_f = btc_amount / multiplier
-        size = math.floor(size_f)
+        btc_amount_long = usdt_per * LEVERAGE / center_long
+        size_f_long = btc_amount_long / multiplier_long
+        size_long = math.floor(size_f_long)
+        self.logger.info(f"BTC amount par ordre LONG : {btc_amount_long:.6f}, Multiplier: {multiplier_long}, Size float: {size_f_long}")
 
-        self.logger.info(f"BTC amount par ordre: {btc_amount:.6f}, Multiplier: {multiplier}, Size float: {size_f}")
-
-        if size < 1:
+        if size_long < 1:
             self.logger.warning(
-                f"Budget insuffisant pour 1 contrat par ordre (size_f={size_f:.2f} contrats) – skip adjust_grid. "
+                f"Budget insuffisant pour 1 contrat par ordre LONG (size_f={size_f_long:.2f} contrats) – skip adjust_grid. "
                 f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
             )
-            return
+
+        # SHORT (XBTUSDM)
+        # 1 contrat = 1 USD, donc on prend simplement le montant en USD alloué avec levier
+        usd_amount_short = usdt_per * LEVERAGE
+        size_f_short = usd_amount_short  # 1 contrat = 1 USD
+        size_short = math.floor(size_f_short)
+        self.logger.info(f"BTC amount par ordre SHORT : {usd_amount_short:.6f}, Multiplier: {multiplier_short}, Size float: {size_f_short}")
+
+        if size_short < 1:
+            self.logger.warning(
+                f"Budget insuffisant pour 1 contrat par ordre SHORT (size_f={size_f_short:.2f} contrats) – skip adjust_grid. "
+                f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
+            )
 
         # --- Placement des ordres ---
         for price in buy_grid:
-            buy_price = round(round(price / tick) * tick, decimals)
-            order_id = self.place_futures_order("buy", size, buy_price, SYMBOL_LONG)
+            buy_price = round(round(price / tick_long) * tick_long, decimals_long)
+            order_id = self.place_futures_order("buy", size_long, buy_price, SYMBOL_LONG)
             if order_id:
-                self.active_orders.append({"id": order_id, "side": "buy", "price": buy_price, "size": size})
+                self.active_orders.append({"id": order_id, "side": "buy", "price": buy_price, "size": size_long})
 
         for price in sell_grid:
-            sell_price = round(round(price / tick) * tick, decimals)
-            order_id = self.place_futures_order("sell", size, sell_price, SYMBOL_SHORT)
+            sell_price = round(round(price / tick_short) * tick_short, decimals_short)
+            order_id = self.place_futures_order("sell", size_short, sell_price, SYMBOL_SHORT)
             if order_id:
-                self.active_orders.append({"id": order_id, "side": "sell", "price": sell_price, "size": size})
+                self.active_orders.append({"id": order_id, "side": "sell", "price": sell_price, "size": size_short})
 
         # --- Sauvegarde de l'état ---
         self.save_state()
@@ -561,8 +583,14 @@ class GridTradingBotFutures:
                 # Log de débogage pour inspecter la réponse
                 self.logger.debug(f"[DEBUG] Détails ordre {order['id']} : {resp.__dict__}")
 
-                # Récupère proprement le statut
-                order_state = getattr(resp, 'order_state', None)
+                # Certaines réponses sont encapsulées dans .data ou des attributs spécifiques
+                if hasattr(resp, "data") and hasattr(resp.data, "order_state"):
+                    order_state = resp.data.order_state
+                elif hasattr(resp, "order_state"):
+                    order_state = resp.order_state
+                else:
+                    order_state = None
+
 
                 if not order_state:
                     continue  # Si pas d'état retourné, on ignore
@@ -602,7 +630,6 @@ class GridTradingBotFutures:
             req = GetPositionListData()
             positions = self.futures_service.get_positions_api().get_position_list(req).data
 
-            # Récupération des anciennes positions (sauvegardées dans state.json)
             previous_positions = getattr(self, 'last_positions', {})
             current_positions = {}
 
@@ -611,58 +638,46 @@ class GridTradingBotFutures:
                     continue
 
                 size = float(pos.current_qty)
-                direction = str(pos.position_side.value).lower()
+                if size == 0:
+                    continue
+
+                direction = "long" if size > 0 else "short"
                 entry_price = float(pos.avg_entry_price)
                 pnl = float(pos.unrealised_pnl)
                 pnl_pct = pnl / (entry_price * abs(size)) if entry_price != 0 else 0
-
                 now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                symbol = pos.symbol
 
-                # --- Notifications ouverture de position ---
-                position_key = f"{direction}_{entry_price:.2f}_{size}"
+                # Clé unique pour suivi des ouvertures/fermetures
+                position_key = f"{symbol}_{direction}_{entry_price:.2f}_{size}"
                 current_positions[position_key] = size
 
+                # Notification ouverture
                 if position_key not in previous_positions:
-                    msg = f"📈 POSITION OUVERTE ({direction.upper()})\n{size} contrat(s) à {entry_price:.2f} USDT"
+                    msg = f"📈 POSITION OUVERTE ({direction.upper()}) [{symbol}] {size} contrat(s) à {entry_price:.2f} USDT"
                     await self.send_telegram_message(msg)
 
-                # --- TP / SL ---
-                if direction == "long" or (direction == "both" and size > 0):
-                    if pnl_pct >= TAKE_PROFIT:
-                        msg = f"💰 TP LONG: +{pnl_pct:.2%}, fermeture {size} contrats."
-                        self.logger.info(msg)
-                        await self.send_telegram_message(msg)
-                        self.pnl_history.append({"type": "TP", "side": "LONG", "pnl_pct": pnl_pct, "timestamp": now})
-                        self.close_position(SYMBOL_LONG, "sell", abs(size))
-                    elif pnl_pct <= -STOP_LOSS:
-                        msg = f"❌ SL LONG: {pnl_pct:.2%}, fermeture {size} contrats."
-                        self.logger.info(msg)
-                        await self.send_telegram_message(msg)
-                        self.pnl_history.append({"type": "SL", "side": "LONG", "pnl_pct": pnl_pct, "timestamp": now})
-                        self.close_position(SYMBOL_LONG, "sell", abs(size))
+                # Take Profit / Stop Loss
+                if pnl_pct >= TAKE_PROFIT:
+                    msg = f"💰 TP {direction.upper()} [{symbol}] : +{pnl_pct:.2%}, fermeture {abs(size)} contrats."
+                    self.logger.info(msg)
+                    await self.send_telegram_message(msg)
+                    self.pnl_history.append({"type": "TP", "side": direction.upper(), "pnl_pct": pnl_pct, "symbol": symbol, "timestamp": now})
+                    self.close_position(symbol, "sell" if direction == "long" else "buy", abs(size))
 
-                elif direction == "short" or (direction == "both" and size < 0):
-                    if pnl_pct >= TAKE_PROFIT:
-                        msg = f"💰 TP SHORT: +{pnl_pct:.2%}, fermeture {abs(size)} contrats."
-                        self.logger.info(msg)
-                        await self.send_telegram_message(msg)
-                        self.pnl_history.append({"type": "TP", "side": "SHORT", "pnl_pct": pnl_pct, "timestamp": now})
-                        self.close_position(SYMBOL_SHORT, "buy", abs(size))
-                    elif pnl_pct <= -STOP_LOSS:
-                        msg = f"❌ SL SHORT: {pnl_pct:.2%}, fermeture {abs(size)} contrats."
-                        self.logger.info(msg)
-                        await self.send_telegram_message(msg)
-                        self.pnl_history.append({"type": "SL", "side": "SHORT", "pnl_pct": pnl_pct, "timestamp": now})
-                        self.close_position(SYMBOL_SHORT, "buy", abs(size))
+                elif pnl_pct <= -STOP_LOSS:
+                    msg = f"❌ SL {direction.upper()} [{symbol}] : {pnl_pct:.2%}, fermeture {abs(size)} contrats."
+                    self.logger.info(msg)
+                    await self.send_telegram_message(msg)
+                    self.pnl_history.append({"type": "SL", "side": direction.upper(), "pnl_pct": pnl_pct, "symbol": symbol, "timestamp": now})
+                    self.close_position(symbol, "sell" if direction == "long" else "buy", abs(size))
 
-            # --- Notifications fermetures ---
+            # Notification fermetures
             closed_positions = set(previous_positions) - set(current_positions)
             for pos_key in closed_positions:
                 await self.send_telegram_message(f"📉 POSITION FERMÉE : {pos_key.replace('_', ' | ')}")
 
-            # Mise à jour des positions sauvegardées
             self.last_positions = current_positions
-
             self.save_state()
 
         except Exception as e:
