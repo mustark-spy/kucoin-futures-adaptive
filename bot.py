@@ -56,6 +56,8 @@ if SYMBOL_LONG.endswith("M"):
 else:
    _sym = SYMBOL_LONG
 BASE_CURRENCY = _sym[-4:]  # "USDT" plutôt que "SDTM"
+SLIPPAGE_BUFFER = float(os.getenv("SLIPPAGE_BUFFER", "0.001"))
+SYMBOL_INFO_CACHE = {}
 
 GRID_SIZE = int(os.getenv("GRID_SIZE", "10"))
 ADJUST_INTERVAL_MIN = int(os.getenv("ADJUST_INTERVAL_MIN", "15"))
@@ -136,6 +138,7 @@ class GridTradingBotFutures:
         self.last_balance: float = 0.0
         self.pnl_history: List[Dict] = []
         self.last_pnl_report: datetime = datetime.utcnow() - timedelta(hours=PNL_REPORT_INTERVAL_H)
+
         self.load_state()
 
     def load_state(self):
@@ -146,8 +149,11 @@ class GridTradingBotFutures:
                 self.active_orders = data.get("active_orders", [])
                 self.last_balance = data.get("last_balance", self.last_balance)
                 self.pnl_history = data.get("pnl_history", [])
-                self.last_pnl_report = datetime.fromisoformat(data.get("last_pnl_report"))
-                self.last_adjust = datetime.fromisoformat(data.get("last_adjust"))
+                ##self.last_pnl_report = datetime.fromisoformat(data.get("last_pnl_report"))
+                ##self.last_adjust = datetime.fromisoformat(data.get("last_adjust"))
+                self.last_pnl_report = datetime.fromisoformat(data.get("last_pnl_report")) if data.get("last_pnl_report") else datetime.utcnow()
+                self.last_adjust = datetime.fromisoformat(data.get("last_adjust")) if data.get("last_adjust") else datetime.utcnow()
+                
                 self.logger.info("State loaded from %s", STATE_FILE)
             except Exception as e:
                 self.logger.error(f"load_state error: {e}")
@@ -327,6 +333,17 @@ class GridTradingBotFutures:
             self.logger.error(f"Erreur cmd_build : {e}")
             await update.message.reply_text(f"❌ Erreur lors de la reconstruction : {e}")
 
+    def round_price(self, price, tick_size):
+        precision = int(-math.log10(tick_size))
+        return round(round(price / tick_size) * tick_size, precision)
+
+    def get_symbol_info(self, symbol: str):
+        if symbol not in SYMBOL_INFO_CACHE:
+            info = self.futures_service.get_market_api().get_symbol(
+                GetSymbolReqBuilder().set_symbol(symbol).build()
+            )            
+            SYMBOL_INFO_CACHE[symbol] = info
+        return SYMBOL_INFO_CACHE[symbol]
 
     def get_klines(self, symbol: str) -> List[Dict]:
         """
@@ -547,13 +564,15 @@ class GridTradingBotFutures:
 
         # --- Placement des ordres ---
         for price in buy_grid:
-            buy_price = round(round(price / tick_long) * tick_long, decimals_long)
+            adjusted_price = price * (1 - SLIPPAGE_BUFFER)
+            buy_price = round(round(adjusted_price / tick_long) * tick_long, decimals_long)
             order_id = self.place_futures_order("buy", size_long, buy_price, SYMBOL_LONG)
             if order_id:
                 self.active_orders.append({"id": order_id, "side": "buy", "price": buy_price, "size": size_long})
 
         for price in sell_grid:
-            sell_price = round(round(price / tick_short) * tick_short, decimals_short)
+            adjusted_price = price * (1 + SLIPPAGE_BUFFER)
+            sell_price = round(round(adjusted_price / tick_short) * tick_short, decimals_short)
             order_id = self.place_futures_order("sell", size_short, sell_price, SYMBOL_SHORT)
             if order_id:
                 self.active_orders.append({"id": order_id, "side": "sell", "price": sell_price, "size": size_short})
@@ -645,7 +664,7 @@ class GridTradingBotFutures:
                 direction = "long" if size > 0 else "short"
                 entry_price = float(pos.avg_entry_price)
                 pnl = float(pos.unrealised_pnl)
-                pnl_pct = pnl / (entry_price * abs(size)) if entry_price != 0 else 0
+                pnl_pct = pnl / float(pos.pos_margin) 
                 now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                 symbol = pos.symbol
 
