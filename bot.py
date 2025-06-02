@@ -488,6 +488,40 @@ class GridTradingBotFutures:
         except Exception as e:
             self.logger.error(f"cancel_futures_order error: {e}")
 
+    def close_position(self, symbol: str):
+        try:
+            position_resp = self.futures_service.get_positions_api().get_position_by_symbol(
+                GetPositionReqBuilder().set_symbol(symbol).build()
+            )
+
+            side = position_resp.side.lower()
+            size = float(position_resp.current_qty)
+            price = float(position_resp.mark_price)
+
+            if size == 0:
+                self.logger.info(f"Aucune position ouverte sur {symbol} à fermer.")
+                return
+
+            # Ordre inverse pour fermer la position
+            closing_side = "sell" if side == "buy" else "buy"
+            self.logger.info(f"Fermeture de position {side.upper()} de {size} contrats sur {symbol} à {price:.2f}")
+
+            order_id = self.place_futures_order(
+                side=closing_side,
+                size=size,
+                price=price,
+                symbol=symbol,
+                reduce_only=True  # Important pour éviter une ouverture inverse
+            )
+
+            if order_id:
+                self.send_telegram_message(
+                    f"📉 Position {side.upper()} fermée sur {symbol} ({size} contrats) au prix de {price:.2f}"
+                )
+
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la fermeture de la position sur {symbol} : {e}")
+
 
     async def adjust_grid(self, context=None) -> None:
         # --- Annulation de tous les ordres ouverts sur KuCoin ---
