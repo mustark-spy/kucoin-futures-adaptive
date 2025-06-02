@@ -509,11 +509,11 @@ class GridTradingBotFutures:
 
         # --- Calcul des bornes ATR SHORT ---
         lower_short, upper_short = self.calculate_atr_bounds(SYMBOL_SHORT)
-        center_short = (lower_long + upper_long) / 2
+        center_short = (lower_short + upper_short) / 2
 
         # --- Grilles BUY sous le prix et SELL au-dessus
-        buy_grid = [center_long - i * (center_long - lower_long) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
-        sell_grid = [center_short + i * (upper_short - center_short) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
+        buy_grid = [center_long - (i + 0.5) * (center_long - lower_long) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
+        sell_grid = [center_short + (i + 0.5) * (upper_short - center_short) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
 
         self.grid_prices = buy_grid + sell_grid
 
@@ -565,6 +565,7 @@ class GridTradingBotFutures:
         message = f"\n\U0001F4CA 📊 Grille ajustée: {GRID_SIZE} BUY + {GRID_SIZE} SELL ordres placés :\n"
         for o in self.active_orders:
             direction = "⬇️ LONG" if o['side'] == "buy" else "⬆️ SHORT"
+            currency = "USDT" if o['side'] == "buy" else "USD"
             message += f"{direction} {o['size']} contrat(s) à {o['price']:.2f} USDT\n"
 
         await self.send_telegram_message(message)
