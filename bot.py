@@ -1,24 +1,122 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Bot de Trading Telegram Futures ATR avec Persistence, Sandbox, Notifications Enrichies et Commandes
-Version utilisant kucoin-universal-sdk & python-telegram-bot
-Inclut ATR-based grid, SL/TP, reporting PnL, sandbox mode, persistence via JSON, commandes /pnl /statut /balance
+bot_dual_rsi_ema.py
+
+KuCoin Dual Position Bot – RSI + EMA Trend Strategy
+
+Fonctionnalités :
+- Ouverture simultanée d’une position LONG (SYMBOL_LONG) et d’une position SHORT (SYMBOL_SHORT).
+- Rééquilibrage périodique toutes les X minutes selon la tendance (RSI + EMA).
+- Gestion automatique du Take Profit, Stop Loss et Trailing Stop.
+- Persistance complète de l’état (budget, PnL, positions ouvertes, historique) dans un fichier JSON.
+- Notifications Telegram à chaque action (ouverture, clôture, dashboard horaire).
+- Dashboard synthétique envoyé chaque heure avec la tendance, le capital actif, et les PnL.
+
+Configuration via `.env` :
+
+```env
+# === PAIRES UTILISÉES ===
+SYMBOL_LONG=XBTUSDTM
+SYMBOL_SHORT=XBTUSDM
+
+# === BUDGET ET RÉPARTITION INITIALE ===
+BUDGET=1000
+REPARTITION_LONG=0.5
+REPARTITION_SHORT=0.5
+
+# === LEVIER ===
+LEVERAGE=6
+
+# === SL / TP / TRAILING ===
+TAKE_PROFIT=0.02        # 2% de profit
+STOP_LOSS=0.01          # 1% de perte maximale
+TRAILING_STOP=0.01      # 1% de trailing stop
+TRAILING_ENABLED=true   # true ou false
+
+# === INDICATEURS DE TENDANCE ===
+RSI_PERIOD=14
+EMA_LONG=50
+RSI_THRESHOLD_HIGH=70
+RSI_THRESHOLD_LOW=30
+
+# === INTERVALLE D’AJUSTEMENT (en minutes) ===
+UPDATE_INTERVAL_MIN=15
+
+# === TELEGRAM ===
+TELEGRAM_BOT_TOKEN=VOTRE_TOKEN_TELEGRAM
+TELEGRAM_CHAT_ID=VOTRE_CHAT_ID
+
+# === PERSITANCE ===
+DATA_DIR=./datas
+```
+
+Pour installer les dépendances :
+
+```bash
+pip install kucoin-universal-sdk python-telegram-bot pandas numpy python-dotenv
+```
 """
-import asyncio
-import math
+
 import os
-import logging
-import uuid
 import json
-from datetime import datetime, timedelta
-from enum import Enum
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+import asyncio
+import logging
+import math
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+
 from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
 
+# ------------------------------------------------------------
+# 1. Lecture des variables d’environnement
+# ------------------------------------------------------------
+SYMBOL_LONG        = os.getenv("SYMBOL_LONG", "XBTUSDTM")
+SYMBOL_SHORT       = os.getenv("SYMBOL_SHORT", "XBTUSDM")
+
+BUDGET             = float(os.getenv("BUDGET", "1000"))
+REPARTITION_LONG   = float(os.getenv("REPARTITION_LONG", "0.5"))
+REPARTITION_SHORT  = float(os.getenv("REPARTITION_SHORT", "0.5"))
+
+LEVERAGE           = int(os.getenv("LEVERAGE", "6"))
+
+TAKE_PROFIT        = float(os.getenv("TAKE_PROFIT", "0.02"))
+STOP_LOSS          = float(os.getenv("STOP_LOSS", "0.01"))
+TRAILING_STOP      = float(os.getenv("TRAILING_STOP", "0.01"))
+TRAILING_ENABLED   = os.getenv("TRAILING_ENABLED", "true").lower() == "true"
+
+RSI_PERIOD         = int(os.getenv("RSI_PERIOD", "14"))
+EMA_SHORT_PERIOD = int(os.getenv("EMA_SHORT_PERIOD", "20"))
+EMA_LONG_PERIOD  = int(os.getenv("EMA_LONG_PERIOD",  "50"))
+RSI_THRESHOLD_HIGH = float(os.getenv("RSI_THRESHOLD_HIGH", "70"))
+RSI_THRESHOLD_LOW  = float(os.getenv("RSI_THRESHOLD_LOW", "30"))
+
+UPDATE_INTERVAL_MIN = int(os.getenv("UPDATE_INTERVAL_MIN", "15"))
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+DATA_DIR           = os.getenv("DATA_DIR", "./datas")
+STATE_FILE_PATH    = Path(DATA_DIR) / "state_trailing_persist.json"
+
+# On garantit que le répertoire de persistance existe
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+# Timezone Europe/Paris
+TZ_PARIS = timezone(timedelta(hours=2))  # UTC+2 en été
+
+# ------------------------------------------------------------
+# 2. Librairies externes KuCoin + Telegram
+# ------------------------------------------------------------
+from kucoin_universal_sdk.api import DefaultClient
+from kucoin_universal_sdk.generate.futures.market import GetMarkPriceReqBuilder
 from kucoin_universal_sdk.api import DefaultClient
 from kucoin_universal_sdk.generate.futures.market import GetKlinesReqBuilder as FuturesKlinesReqBuilder
 from kucoin_universal_sdk.generate.futures.market import GetSymbolReqBuilder
@@ -31,7 +129,7 @@ from kucoin_universal_sdk.generate.futures.order import GetOrderListReqBuilder
 from kucoin_universal_sdk.generate.futures.positions import GetPositionListData
 
 from kucoin_universal_sdk.generate.account.account import GetFuturesAccountReqBuilder
-from kucoin_universal_sdk.generate.service import SpotService, FuturesService, AccountService
+from kucoin_universal_sdk.generate.service import FuturesService, AccountService
 from kucoin_universal_sdk.model import (
     ClientOptionBuilder,
     TransportOptionBuilder,
@@ -39,78 +137,32 @@ from kucoin_universal_sdk.model import (
     GLOBAL_FUTURES_API_ENDPOINT,
     GLOBAL_BROKER_API_ENDPOINT,
 )
-from telegram import Update
+from telegram import Bot
+from telegram.error import TelegramError
+
+# POUR LES COMMAND HANDLERS
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    JobQueue,
 )
 
-# Configuration
-SYMBOL_LONG = os.getenv("SYMBOL_LONG", "XBTUSDTM")
-SYMBOL_SHORT = os.getenv("SYMBOL_SHORT", "XBTUSDM")
-# Si trailing "M" (perpétuel), on l'enlève pour déterminer la devise
-if SYMBOL_LONG.endswith("M"):
-    _sym = SYMBOL_LONG[:-1]
-else:
-   _sym = SYMBOL_LONG
-BASE_CURRENCY = _sym[-4:]  # "USDT" plutôt que "SDTM"
-SLIPPAGE_BUFFER = float(os.getenv("SLIPPAGE_BUFFER", "0.001"))
-SYMBOL_INFO_CACHE = {}
+# ------------------------------------------------------------
+# 3. Configuration du logging
+# ------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("DualRSIEMA-Bot")
 
-GRID_SIZE = int(os.getenv("GRID_SIZE", "10"))
-ADJUST_INTERVAL_MIN = int(os.getenv("ADJUST_INTERVAL_MIN", "15"))
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-STOP_LOSS = float(os.getenv("STOP_LOSS", "0.01"))
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))
-BUDGET = float(os.getenv("BUDGET", "1000"))
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-PNL_REPORT_INTERVAL_H = int(os.getenv("PNL_REPORT_INTERVAL_H", "1"))
-
-# Sandbox endpoints
-SANDBOX = os.getenv("SANDBOX", "false").lower() in ("1","true","yes")
-SPOT_ENDPOINT = "https://openapi-sandbox.kucoin.com" if SANDBOX else GLOBAL_API_ENDPOINT
-FUTURES_ENDPOINT = GLOBAL_FUTURES_API_ENDPOINT
-
-# Persistence
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "state.json"
-
-# Spot SYMBOL_LONG for ATR calculation
-SPOT_SYMBOL = f"{SYMBOL_LONG[:-len(BASE_CURRENCY)-1]}-{BASE_CURRENCY}"
-
-class MarketSide(Enum):
-    BUY = "buy"
-    SELL = "sell"
-
-class GridTradingBotFutures:
+# ------------------------------------------------------------
+# 4. Classe principale du bot
+# ------------------------------------------------------------
+class DualRSIEMABot:
     def __init__(self):
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(message)s")
-        self.logger = logging.getLogger(__name__)
-        
-        # Telegram setup
-        self.telegram_token = os.getenv("TELEGRAM_TOKEN")
-        if not self.telegram_token:
-            raise RuntimeError("TELEGRAM_TOKEN n'est pas défini")
-        self.chat_id = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-        self.app = ApplicationBuilder().token(self.telegram_token).build()
-        if self.app.job_queue is None:
-            jq = JobQueue()
-            jq.set_dispatcher(self.app.dispatcher)
-            jq.start()
-            self.app.job_queue = jq
-
-        # Handlers
-        self.app.add_handler(CommandHandler("pnl", self.cmd_pnl))
-        self.app.add_handler(CommandHandler("statut", self.cmd_statut))
-        self.app.add_handler(CommandHandler("balance", self.cmd_balance))
-        self.app.add_handler(CommandHandler("position", self.cmd_position))
-        self.app.add_handler(CommandHandler("build", self.cmd_build))
-
-
-        # KuCoin SDK
+        # Initialisation du client KuCoin
         key = os.getenv("KUCOIN_API_KEY", "")
         secret = os.getenv("KUCOIN_API_SECRET", "")
         passphrase = os.getenv("KUCOIN_API_PASSPHRASE", "")
@@ -120,644 +172,862 @@ class GridTradingBotFutures:
             .set_key(key)
             .set_secret(secret)
             .set_passphrase(passphrase)
-            .set_spot_endpoint(SPOT_ENDPOINT)
-            .set_futures_endpoint(FUTURES_ENDPOINT)
+            .set_spot_endpoint(GLOBAL_API_ENDPOINT)
+            .set_futures_endpoint(GLOBAL_FUTURES_API_ENDPOINT)
             .set_broker_endpoint(GLOBAL_BROKER_API_ENDPOINT)
             .set_transport_option(transport)
         )
-        client = DefaultClient(client_opts.build())
-        rest = client.rest_service()
-        self.spot_service: SpotService = rest.get_spot_service()
+        self.client = DefaultClient(client_opts.build())
+        rest = self.client.rest_service()
         self.futures_service: FuturesService = rest.get_futures_service()
         self.account_service: AccountService = rest.get_account_service()
 
-        # State
-        self.grid_prices: List[float] = []
-        self.active_orders: List[Dict] = []
-        self.last_adjust: datetime = datetime.utcnow() - timedelta(minutes=ADJUST_INTERVAL_MIN)
-        self.last_balance: float = 0.0
-        self.pnl_history: List[Dict] = []
-        self.last_pnl_report: datetime = datetime.utcnow() - timedelta(hours=PNL_REPORT_INTERVAL_H)
-
-        self.load_state()
-
-    def load_state(self):
-        if STATE_FILE.exists():
-            try:
-                data = json.loads(STATE_FILE.read_text())
-                self.grid_prices = data.get("grid_prices", [])
-                self.active_orders = data.get("active_orders", [])
-                self.last_balance = data.get("last_balance", self.last_balance)
-                self.pnl_history = data.get("pnl_history", [])
-                ##self.last_pnl_report = datetime.fromisoformat(data.get("last_pnl_report"))
-                ##self.last_adjust = datetime.fromisoformat(data.get("last_adjust"))
-                self.last_pnl_report = datetime.fromisoformat(data.get("last_pnl_report")) if data.get("last_pnl_report") else datetime.utcnow()
-                self.last_adjust = datetime.fromisoformat(data.get("last_adjust")) if data.get("last_adjust") else datetime.utcnow()
-                
-                self.logger.info("State loaded from %s", STATE_FILE)
-            except Exception as e:
-                self.logger.error(f"load_state error: {e}")
-
-    def save_state(self):
-        try:
-            data = {
-                "grid_prices": self.grid_prices,
-                "active_orders": self.active_orders,
-                "last_balance": self.last_balance,
-                "pnl_history": self.pnl_history,
-                "last_pnl_report": self.last_pnl_report.isoformat(),
-                "last_adjust": self.last_adjust.isoformat(),
-            }
-            STATE_FILE.write_text(json.dumps(data, indent=2))
-            self.logger.info("State saved to %s", STATE_FILE)
-        except Exception as e:
-            self.logger.error(f"save_state error: {e}")
-
-    async def startup_notify(self, context=None) -> None:
-        await self.app.bot.send_message(
-            chat_id=self.chat_id,
-            text=(f"🚀 <b>Bot Futures ATR démarré</b>\n"
-                  f"SYM: {SYMBOL_LONG} LEV: {LEVERAGE} GRID: {GRID_SIZE}\n"
-                  f"Sandbox: {SANDBOX}"),
-            parse_mode='HTML'
+        # Initialisation du bot Telegram
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.error("Variables TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID non définies.")
+            raise RuntimeError("Configuration Telegram manquante.")
+        self.telegram_bot = Bot(token=TELEGRAM_TOKEN)
+        self.telegram_chat_id = TELEGRAM_CHAT_ID
+        # Création de l’Application (pour gérer les commandes /statut, etc.)
+        self.telegram_app = (
+            ApplicationBuilder()
+            .token(TELEGRAM_TOKEN)
+            .build()
         )
 
-    async def send_telegram_message(self, message: str) -> None:
-        try:
-            await self.app.bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            self.logger.error(f"Erreur envoi Telegram : {e}")
+        # Enregistrement du handler /statut
+        # Quand l’utilisateur envoie “/statut”, on appelle la méthode `cmd_statut`
+        self.telegram_app.add_handler(CommandHandler("statut", self.cmd_statut))
+        self.telegram_app.add_handler(CommandHandler("check", self.cmd_check))
 
-    async def cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self.pnl_history:
-            await self.send_telegram_message("📉 Aucun trade enregistré pour le moment.")
-            return
+        # État persistant
+        self.state = {
+            "budget_restant": BUDGET,
+            "pertes_cumulees": 0.0,
+            "profits_proteges": 0.0,
+            "positions_actives": {},  # clés : SYMBOL_LONG / SYMBOL_SHORT
+            "historique": []           # liste d’événements PnL
+        }
+        self._load_state()
 
-        report = "\U0001F4C8 Historique PnL (TP/SL) :\n"
-        for entry in self.pnl_history[-10:]:
-            report += f"{entry['timestamp']} - {entry['type']} {entry['side']} : {entry['pnl_pct']:.2%}\n"
+        # Pour le trailing stop, on stocke le prix extrême le plus favorable atteint depuis l’ouverture
+        self.trailing_high_low = {
+            SYMBOL_LONG: None,   # pour les longs, prix max atteint
+            SYMBOL_SHORT: None   # pour les shorts, prix min atteint
+        }
 
-        await self.send_telegram_message(report)
-
-    async def cmd_statut(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            msg = "\U0001F4DD <b>STATUT ACTUEL</b>\n"
-
-            # --- Dernières positions ouvertes ---
-            req = GetPositionListData()
-            positions = self.futures_service.get_positions_api().get_position_list(req).data
-            open_pos = [p for p in positions if p.symbol == SYMBOL_LONG and float(p.current_qty) != 0]
-
-            if open_pos:
-                msg += "\n<b>📌 Positions ouvertes :</b>\n"
-                for p in open_pos:
-                    pnl_pct = float(p.unrealised_pnl) / (float(p.avg_entry_price) * abs(float(p.current_qty)))
-                    msg += f"{p.position_side.value.upper()} {p.current_qty} @ {p.avg_entry_price:.2f} | PnL: {p.unrealised_pnl:.2f} USDT ({pnl_pct:.2%})\n"
-            else:
-                msg += "\n<b>📌 Aucune position ouverte.</b>\n"
-
-            # --- Ordres actifs ---
-            if self.active_orders:
-                msg += "\n<b>📦 Ordres en attente :</b>\n"
-                for o in self.active_orders:
-                    arrow = "⬇️" if o['side'] == "buy" else "⬆️"
-                    msg += f"{arrow} {o['side'].upper()} {o['size']} @ {o['price']:.2f} USDT\n"
-            else:
-                msg += "\n<b>📦 Aucun ordre actif.</b>\n"
-
-            # --- Dernier PnL ---
-            if self.pnl_history:
-                last = self.pnl_history[-1]
-                msg += f"\n<b>Dernier PnL :</b> {last['type']} {last['side']} - {last['pnl_pct']:.2%} ({last['timestamp']})\n"
-
-            await self.send_telegram_message(msg)
-        except Exception as e:
-            self.logger.error(f"cmd_statut error: {e}")
-
-
-    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        bal = float(
-            self.account_service.get_account_api()
-            .get_futures_account(GetFuturesAccountReqBuilder().set_currency(BASE_CURRENCY).build())
-            .available_balance
-        )
-        await update.message.reply_text(f"💰 Balance futures: {bal:.4f} {BASE_CURRENCY}")
-
-    async def cmd_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            symbol_info = self.futures_service.get_market_api().get_symbol(
-                GetSymbolReqBuilder().set_symbol(SYMBOL_LONG).build()
-            )
-            last_price = float(symbol_info.mark_price)
-            multiplier = float(symbol_info.multiplier)
-            usdt_per = float(BUDGET/2) / 10  # 10% du budget pour chaque sens
-            btc_amount = usdt_per * float(LEVERAGE) / last_price
-            size_f = btc_amount / multiplier
-            size = math.floor(size_f)
-
-            if size < 1:
-                await self.send_telegram_message("❗ Budget trop faible pour une position de test.")
-                return
-
+    # --------------------------------------------------------
+    # 4.1. Chargement et sauvegarde de l’état
+    # --------------------------------------------------------
+    def _load_state(self):
+        if STATE_FILE_PATH.exists():
             try:
-                order = self.futures_service.get_order_api().add_order(
-                    FuturesAddOrderReqBuilder()
-                    .set_client_oid(str(uuid.uuid4()))
-                    .set_symbol(SYMBOL_LONG)
-                    .set_side("buy")         # "buy" ou "sell"
-                    .set_type("market")
-                    .set_size(size)
-                    .set_leverage(LEVERAGE)
-                    .set_remark("forced-position")
-                    .build()
-                )
-                if order.order_id:
-                    self.logger.info(f"✅ Ordre LONG placé pour forcer la position [{SYMBOL_LONG}]. ID: {order.order_id}")
-                    asyncio.create_task(self.send_telegram_message(f"✅ Ordre LONG placé pour forcer la position [{SYMBOL_LONG}]. ID: {order.order_id}"))
-                    return order.order_id
-                else:
-                    self.logger.error(f"❌ Erreur de placement ORDRE LONG : {result}")
-                    return None
+                with open(STATE_FILE_PATH, "r", encoding="utf-8") as f:
+                    self.state = json.load(f)
+                logger.info("État chargé depuis %s.", STATE_FILE_PATH)
             except Exception as e:
-                self.logger.error(f"Erreur de placement ORDRE LONG: {e}")
+                logger.error("Impossible de charger l’état : %s", e)
 
-            try:
-                order = self.futures_service.get_order_api().add_order(
-                    FuturesAddOrderReqBuilder()
-                    .set_client_oid(str(uuid.uuid4()))
-                    .set_symbol(SYMBOL_SHORT)
-                    .set_side("sell")         # "buy" ou "sell"
-                    .set_type("market")
-                    .set_size(size)
-                    .set_leverage(LEVERAGE)
-                    .set_remark("forced-position")
-                    .build()
-                )
-                if order.order_id:
-                    self.logger.info(f"✅ Ordre SHORT placé pour forcer la position [{SYMBOL_SHORT}]. ID: {order.order_id}")
-                    asyncio.create_task(self.send_telegram_message(f"✅ Ordre SHORT placé pour forcer la position [{SYMBOL_SHORT}]. ID: {order.order_id}"))
-                    return order.order_id
-                else:
-                    self.logger.error(f"❌ Erreur de placement ORDRE SHORT : {result}")
-                    return None
-            except Exception as e:
-                self.logger.error(f"Erreur de placement ORDRE SHORT: {e}")
-
-            await self.send_telegram_message(f"🚀 Position forcée : LONG et SHORT {size} contrats chacun.")
-
-        except Exception as e:
-            self.logger.error(f"cmd_position error: {e}")
-            await self.send_telegram_message(f"❌ Erreur ouverture position : {e}")
-
-
-    async def cmd_build(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    def _save_state(self):
         try:
-            await update.message.reply_text("🔧 Reconstruction manuelle de la grille en cours...")
-            
-            # 1. Annule tous les ordres ouverts
-            self.cancel_all_open_orders(SYMBOL_LONG)
-            self.cancel_all_open_orders(SYMBOL_SHORT)
-            # Réinitialisation de l’état local
-            self.active_orders.clear()
-            self.grid_prices.clear()
-
-            # 2. Recalcule et place une nouvelle grille
-            await self.adjust_grid()
-
-            await update.message.reply_text("✅ Nouvelle grille construite avec succès.")
+            with open(STATE_FILE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, indent=4, ensure_ascii=False)
+            logger.debug("État sauvegardé dans %s.", STATE_FILE_PATH)
         except Exception as e:
-            self.logger.error(f"Erreur cmd_build : {e}")
-            await update.message.reply_text(f"❌ Erreur lors de la reconstruction : {e}")
+            logger.error("Impossible de sauvegarder l’état : %s", e)
 
-    def round_price(self, price, tick_size):
-        precision = int(-math.log10(tick_size))
-        return round(round(price / tick_size) * tick_size, precision)
-
-    def get_symbol_info(self, symbol: str):
-        if symbol not in SYMBOL_INFO_CACHE:
-            info = self.futures_service.get_market_api().get_symbol(
-                GetSymbolReqBuilder().set_symbol(symbol).build()
-            )            
-            SYMBOL_INFO_CACHE[symbol] = info
-        return SYMBOL_INFO_CACHE[symbol]
-
-    def get_klines(self, symbol: str) -> List[Dict]:
+    # --------------------------------------------------------
+    # 4.2. Envoi de messages Telegram
+    # --------------------------------------------------------
+    async def send_telegram_message(self, texte: str):
         """
-        Récupère les bougies horaires pour le contrat futures.
+        Envoie un message texte au chat configuré.
         """
-        self.logger.info(f"Fetching {ATR_PERIOD+1} futures klines for {symbol} (1h)")
+        try:
+            await self.telegram_bot.send_message(chat_id=self.telegram_chat_id, text=texte)
+            logger.debug("Message Telegram envoyé : %s", texte)
+        except TelegramError as e:
+            logger.error("Erreur d’envoi Telegram : %s", e)
+
+    async def cmd_statut(self, update: "telegram.Update", context: ContextTypes.DEFAULT_TYPE):
+        """
+        Callback pour la commande /statut.
+        Appelle la méthode de dashboard et renvoie le résumé au chat.
+        """
+        # On envoie d’abord un message d’accusé de réception si vous voulez.
+        await update.message.reply_text("📋 Voici l’état actuel du bot :")
+
+        # Puis on appelle la méthode interne qui envoie le dashboard.
+        # On peut soit renvoyer un message séparé, soit reformater pour l’utilisateur.
+        await self.send_hourly_dashboard()
+
+    async def cmd_check(self, update: "telegram.Update", context: ContextTypes.DEFAULT_TYPE):
+        """
+        Callback pour la commande /statut.
+        Appelle la méthode de dashboard et renvoie le résumé au chat.
+        """
+        # On envoie d’abord un message d’accusé de réception si vous voulez.
+        await update.message.reply_text("📋 Vérification tendance manuelle")
+
+        # Puis on appelle la méthode interne qui envoie le dashboard.
+        # On peut soit renvoyer un message séparé, soit reformater pour l’utilisateur.
+        await self.rebalance()
+
+    # --------------------------------------------------------
+    # 4.3. Récupération des bougies (candles)
+    # --------------------------------------------------------
+    async def fetch_klines(self, symbol: str, interval_min: int = 1, limit: int = 200) -> pd.DataFrame:
+        """
+        Récupère les bougies OHLCV pour un symbole donné sur KuCoin Futures.
+
+        - symbol:         ex. "XBTUSDTM" ou "XBTUSDM"
+        - interval_min:   intervalle en minutes (ex. 1 pour 1min, 15 pour 15min, 60 pour 1h, etc.)
+        - limit:          nombre maximal de bougies à récupérer (<= 500)
+
+        Retourne un DataFrame pandas avec les colonnes ['timestamp', 'open', 'high', 'low', 'close', 'volume'].
+        """
+
+        # 1) Construire le builder avec symbol + granularité (en secondes)
+        granularity = interval_min * 60
         builder = (
             FuturesKlinesReqBuilder()
             .set_symbol(symbol)
-            .set_granularity(60)           # 1h = 60 minutes
+            .set_granularity(granularity)
         )
-        try:
-            builder = builder.set_from(
-                int((datetime.utcnow() - timedelta(hours=ATR_PERIOD+1)).timestamp() * 1000)
-            ).set_to(int(datetime.utcnow().timestamp() * 1000))
-        except AttributeError:
-            # si votre version du SDK n'implémente pas set_from/set_to, vous récupérez
-            # par défaut les dernières données (jusqu'à 500 bougies)
-            self.logger.debug("FuturesKlinesReqBuilder.set_from/set_to unavailable")
-        req = builder.build()
-        resp = self.futures_service.get_market_api().get_klines(req)
-        return resp.data
 
-    def get_order_status(self, order_id: str) -> str:
+        # 2) Si possible, ajouter la plage from/to pour limiter à (limit) bougies récentes
         try:
-            response = self.futures_service.get_order_api().get_order_by_order_id(
-                FuturesGetOrderReqBuilder().set_order_id(order_id).build()
-            )
-            return response.status  # ex : "FILLED", "OPEN", "CANCELLED"
+            # On récupère les (limit) dernières bougies jusqu’à maintenant
+            ts_to   = int(datetime.now(timezone.utc).timestamp() * 1000)
+            ts_from = int((datetime.now(timezone.utc) - timedelta(minutes=interval_min * limit)).timestamp() * 1000)
+            builder = builder.set_from(ts_from).set_to(ts_to)
+        except AttributeError:
+            # set_from / set_to non implémentés : on se contente de récupérer
+            # les dernières bougies (jusqu’à `limit`)
+            logger.debug("FuturesKlinesReqBuilder.set_from/set_to indisponible, on récupère les dernières bougies.")
+
+        # 3) Build + appel API
+        req = builder.build()
+        try:
+            resp = self.futures_service.get_market_api().get_klines(req)
+            klines = resp.data  # liste de listes : [timestamp, open, high, low, close, volume, ...]
         except Exception as e:
-            self.logger.error(f"Erreur récupération statut ordre {order_id} : {e}")
-            return "UNKNOWN"
+            logger.error("Erreur fetch_klines(%s) : %s", symbol, e)
+            return pd.DataFrame()
 
-    def calculate_atr_bounds(self, symbol: str) -> Tuple[float, float]:
-        """
-        Calcule les bornes [lower, upper] = price ± ATR directement sur le marché futures.
-        """
-        # 1) on récupère les klines futures
-        # le endpoint GET /api/v1/kline/query supporte granularity=60 (1 h)
-        builder = (
-            FuturesKlinesReqBuilder()
-            .set_symbol(symbol)
-            .set_granularity(60)      # 1h = 60 minutes
+        # 4) Conversion en DataFrame pandas
+        df = pd.DataFrame(
+            klines,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                *["_"] * (len(klines[0]) - 6)
+            ]
         )
-        # optionnel : définir from/to ; si votre SDK le supporte, sinon on prend le défaut
-        try:
-            ts_end = int(datetime.utcnow().timestamp())
-            ts_start = ts_end - (ATR_PERIOD + 1) * 3600
-            builder = builder.set_start_at(ts_start).set_end_at(ts_end)
-        except AttributeError:
-            self.logger.debug("set_start_at/set_end_at non disponible, on prend les dernières bougies par défaut")
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
 
-        req = builder.build()
-        resp = self.futures_service.get_market_api().get_klines(req)
-        klines = resp.data  # liste de [time, open, close, high, low, volume, turnover]
-
-        # 2) on extrait high, low, close et on calcule le True Range
-        highs  = [float(candle[3]) for candle in klines]
-        lows   = [float(candle[4]) for candle in klines]
-        closes = [float(candle[2]) for candle in klines]
-
-        trs = []
-        for i in range(1, len(klines)):
-            h, l, prev_c = highs[i], lows[i], closes[i-1]
-            trs.append(max(
-                h - l,
-                abs(h - prev_c),
-                abs(l - prev_c),
-            ))
-        atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
-
-        # 3) on récupère le dernier prix futures
-        symbol_info = self.futures_service.get_market_api().get_symbol(
-            GetSymbolReqBuilder().set_symbol(symbol).build()
+        # 5) Conversion des types
+        df["timestamp"] = (
+            pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+              .dt.tz_convert(TZ_PARIS)
         )
-        price = float(symbol_info.last_trade_price)
+        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
 
-        return price - atr, price + atr
+        return df
 
-    def place_futures_order(self, side: MarketSide, size: float, price: float, symbol: str) -> Optional[str]:
+
+    # --------------------------------------------------------
+    # 4.4. Calcul des indicateurs RSI et EMA
+    # --------------------------------------------------------
+    def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Place un ordre futures LIMIT et renvoie l'order_id ou None en cas d'erreur.
+        Ajoute trois colonnes au DataFrame :
+         - 'EMA_SHORT' : l’EMA sur la période EMA_SHORT_PERIOD (ex. 20)
+         - 'EMA_LONG'  : l’EMA sur la période EMA_LONG_PERIOD (ex. 50)
+         - 'RSI'       : le RSI sur la période RSI_PERIOD
+        """
+        # On vérifie qu’il y a suffisamment de barres pour au moins
+        # la période la plus longue entre EMA_LONG_PERIOD et RSI_PERIOD
+        min_len = max(RSI_PERIOD, EMA_LONG_PERIOD) + 1
+        if df.empty or len(df) < min_len:
+            return df
+
+        # Calcul de l’EMA « courte » (ex. EMA20)
+        df["EMA_SHORT"] = df["close"].ewm(span=EMA_SHORT_PERIOD, adjust=False).mean()
+
+        # Calcul de l’EMA « longue »  (ex. EMA50)
+        df["EMA_LONG"]  = df["close"].ewm(span=EMA_LONG_PERIOD,  adjust=False).mean()
+
+        # Calcul du RSI (inchangé)
+        delta = df["close"].diff()
+        gain  = delta.where(delta > 0, 0.0)
+        loss  = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.rolling(window=RSI_PERIOD, min_periods=RSI_PERIOD).mean()
+        avg_loss = loss.rolling(window=RSI_PERIOD, min_periods=RSI_PERIOD).mean()
+        rs = avg_gain / (avg_loss.replace(0, np.nan))
+        df["RSI"] = 100 - (100 / (1 + rs))
+        df["RSI"] = df["RSI"].fillna(50)
+
+
+        return df
+
+
+    # --------------------------------------------------------
+    # 4.5. Détermination de la tendance (bullish / bearish / neutre)
+    # --------------------------------------------------------
+    def determine_trend(self, df: pd.DataFrame) -> str:
+        """
+        Détermine la tendance à partir des deux derniers points :
+         - Si EMA_SHORT > EMA_LONG ET RSI < RSI_THRESHOLD_HIGH : bullish
+         - Si EMA_SHORT < EMA_LONG ET RSI > RSI_THRESHOLD_LOW  : bearish
+         - Sinon : neutral
+        """
+        if df.empty or len(df) < 2:
+            return "neutral"
+
+        dernier = df.iloc[-1]
+        ema_short = dernier["EMA_SHORT"]
+        ema_long  = dernier["EMA_LONG"]
+        rsi       = dernier["RSI"]
+
+        if (ema_short > ema_long) and (rsi < RSI_THRESHOLD_HIGH):
+            return "bullish"
+        elif (ema_short < ema_long) and (rsi > RSI_THRESHOLD_LOW):
+            return "bearish"
+        else:
+            return "neutral"
+
+
+    # --------------------------------------------------------
+    # 4.6. Récupérer le prix mark (pour calcul PnL ou trailling)
+    # --------------------------------------------------------
+    async def get_mark_price(self, symbol: str) -> float:
+        """
+        Récupère le prix mark (value) du contrat sur KuCoin Futures.
         """
         try:
-            order = self.futures_service.get_order_api().add_order(
-                FuturesAddOrderReqBuilder()
-                .set_client_oid(str(uuid.uuid4()))
+            req = (
+                GetMarkPriceReqBuilder()
                 .set_symbol(symbol)
-                .set_side(side)         # "buy" ou "sell"
-                .set_type("limit")            # chaîne "limit"
-                .set_price(str(price))
-                .set_size(size)
-                .set_leverage(LEVERAGE)
-                .set_remark("atr-grid")
                 .build()
             )
-            if order.order_id:
-                self.logger.info(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats [{symbol.upper()}]. ID: {order.order_id}")
-                asyncio.create_task(self.send_telegram_message(f"✅ Ordre {side.upper()} placé à {price} pour {size} contrats [{symbol.upper()}]. ID: {order.order_id}"))
-                return order.order_id
-            else:
-                self.logger.error(f"❌ Réponse inattendue: {result}")
-                return None
+            resp = self.futures_service.get_market_api().get_mark_price(req)
+
+            # Dans la version actuelle du SDK, le prix mark se trouve dans resp.value
+            return float(resp.value)
+
         except Exception as e:
-            self.logger.error(f"place_futures_order error: {e}")
+            logger.error("Erreur get_mark_price(%s) : %s", symbol, e)
+            return 0.0
+
+
+    # --------------------------------------------------------
+    # 4.7. Gestion de l’ouverture de position (market order)
+    # --------------------------------------------------------
+    async def open_position(self, symbol: str, side: str, notional_usdt: float):
+        """
+        Ouvre une position market sur `symbol` (LONG ou SHORT) en allouant `notional_usdt` USDT.
+        Puis lit directement la liste des positions pour récupérer le prix d'entrée (avg_entry_price)
+        et les données de PnL / marge.
+        """
+
+        try:
+            # 1) Récupérer le prix mark pour dimensionner la position
+            mark_price = await self.get_mark_price(symbol)
+            if mark_price <= 0:
+                await self.send_telegram_message(f"❌ Impossible d’obtenir mark_price pour {symbol}.")
+                return None
+
+            # 2) Calculer la taille (raw_size) selon le type de contrat
+            if symbol.endswith("USDM"):
+                # Inverse / coin-margined : 1 contrat = 1 USD de BTC
+                raw_size = notional_usdt * LEVERAGE
+            elif symbol.endswith("USDTM"):
+                # Linéaire USDT-margined : 1 contrat = 0.001 BTC
+                raw_size = (notional_usdt * LEVERAGE) / (mark_price * 0.001)
+            else:
+                # Cas générique linéaire (1 contrat = 1 unité de base)
+                raw_size = (notional_usdt / mark_price) * LEVERAGE
+
+            size = math.floor(raw_size)
+            if size < 1:
+                await self.send_telegram_message(
+                    f"❗ Taille trop faible ({raw_size:.4f}) pour ouvrir une position sur {symbol}."
+                )
+                return None
+
+            # 3) Envoi de l’ordre MARKET
+            add_req = (
+                FuturesAddOrderReqBuilder()
+                .set_client_oid(f"dualrsiema-{symbol}-{datetime.now(TZ_PARIS).strftime('%Y%m%d%H%M%S')}")
+                .set_symbol(symbol)
+                .set_side("buy" if side == "LONG" else "sell")
+                .set_type("market")
+                .set_size(str(size))
+                .set_leverage(str(LEVERAGE))
+                .build()
+            )
+            resp = self.futures_service.get_order_api().add_order(add_req)
+            order_id = getattr(resp, "order_id", None)
+            if order_id is None:
+                logger.error("Aucun order_id retourné pour %s", symbol)
+                return None
+
+            # 4) Attendre très brièvement pour laisser le temps à l’ordre d’apparaître dans la liste de positions
+            await asyncio.sleep(0.5)
+
+            # 5) Lire la liste des positions ouvertes
+            req_pos = GetPositionListData()
+            positions = self.futures_service.get_positions_api().get_position_list(req_pos).data
+
+            # 6) Rechercher la position correspondant à `symbol` et à notre SIDE
+            entry_price = None
+            pnl          = 0.0
+            pos_margin   = 0.0
+            found        = False
+
+            for pos in positions:
+                # Pos.symbol = "XBTUSDTM" ou "XBTUSDM", etc.
+                if pos.symbol != symbol:
+                    continue
+
+                # current_qty positif = long, négatif = short
+                size_live = float(pos.current_qty)
+                if size_live == 0:
+                    continue
+
+                # On déduit le sens de la position uniquement d’après le signe de size_live
+                direction = "LONG" if size_live > 0 else "SHORT"
+
+                # Si ce sens ne correspond pas à celui qu’on vient d’ouvrir, on passe à la suivante
+                if direction != side:
+                    continue
+
+                # On a trouvé la position active pour ce symbol + side
+                found = True
+                entry_price = float(pos.avg_entry_price)
+                pnl         = float(pos.unrealised_pnl)
+                pos_margin  = float(pos.pos_margin)
+                break
+
+            if not found:
+                logger.error(
+                    "Impossible de retrouver la position %s %s dans la liste des positions après 0.5s",
+                    symbol, side
+                )
+                return None
+
+            # 7) Mise à jour de l’état persistant
+            timestamp = datetime.now(TZ_PARIS).isoformat()
+            logger.info(
+                "Position ouverte %s %s %s contrats @ %f, PnL=%.6f, Margin=%.6f",
+                symbol, side, size, entry_price, pnl, pos_margin
+            )
+
+            # Sauvegarde des données utiles dans state
+            self.state["positions_actives"][symbol] = {
+                "side": side,
+                "entry_price": entry_price,
+                "size": size,
+                "order_id": order_id,
+                "timestamp": timestamp,
+                # Pour trailing stop, on stocke le prix d’entrée comme "best_price"
+                "best_price": entry_price,
+                "unrealised_pnl": pnl,
+                "pos_margin": pos_margin
+            }
+            self._save_state()
+
+            # 8) Notification Telegram
+            await self.send_telegram_message(
+                f"🚀 OUVERTURE {side} {symbol} : size={size}, entry_price={entry_price:.2f} "
+                f"Pnl={pnl:.6f}, Margin={pos_margin:.6f}"
+            )
+            return order_id
+
+        except Exception as e:
+            logger.error("Erreur open_position(%s, %s) : %s", symbol, side, e)
+            await self.send_telegram_message(f"❌ Erreur ouverture {side} pour {symbol} : {e}")
             return None
 
-    def cancel_all_open_orders(self, symbol: str):
+
+    # --------------------------------------------------------
+    # 4.8. Gestion de clôture de position
+    # --------------------------------------------------------
+    async def close_position(self, symbol: str):
         """
-        Annule tous les ordres ouverts pour le symbole défini.
+        Clôture la position active sur `symbol` (market order inverse),
+        en extrayant le fill_price depuis l'objet AddOrderResp (et non plus un dict).
+        Puis calcule le PnL réalisé, met à jour le budget, l'état, et envoie la notification Telegram.
         """
+        # 1) Vérifier qu’il y a bien une position active dans self.state
+        info = self.state["positions_actives"].get(symbol)
+        if not info:
+            # Pas de position à fermer
+            return
+
+        side   = info["side"]          # "LONG" ou "SHORT"
+        size   = info["size"]          # nombre de contrats
+        entry  = info["entry_price"]   # prix d’entrée stocké
+
+        # On détermine le side inverse pour la fermeture du marché
+        close_side = "sell" if side == "LONG" else "buy"
+
         try:
-            req = GetOrderListReqBuilder().set_symbol(symbol).set_status("active").build()
-            response = self.futures_service.get_order_api().get_order_list(req)
-            
-            open_orders = getattr(response, "items", None) or getattr(response, "data", [])
-            
-            if not open_orders:
-                self.logger.info("Aucun ordre ouvert à annuler.")
+            # 2) Envoi de l’ordre MARKET inverse pour fermer la position
+            resp = self.futures_service.get_order_api().add_order(
+                FuturesAddOrderReqBuilder()
+                .set_client_oid(f"dualrsiema-close-{symbol}-{datetime.now(TZ_PARIS).strftime('%Y%m%d%H%M%S')}")
+                .set_symbol(symbol)
+                .set_side(close_side)
+                .set_type("market")
+                .set_size(str(size))
+                .set_leverage(str(LEVERAGE))
+                .build()
+            )
+
+            # 3) Extraction du fill_price depuis l’objet AddOrderResp
+            # On teste plusieurs attributs possibles selon la version du SDK :
+            fill_price = None
+
+            # a) Si le SDK expose directement resp.fill_price
+            if hasattr(resp, "fill_price"):
+                fill_price = float(resp.fill_price)
+            # b) Sinon, si c’est resp.fillPrice
+            elif hasattr(resp, "fillPrice"):
+                fill_price = float(resp.fillPrice)
+            # c) Sinon, si le SDK stocke dans resp.common_response.data (un dict)
+            else:
+                common_data = getattr(resp, "common_response", None)
+                if common_data and isinstance(common_data, object):
+                    data_dict = getattr(common_data, "data", None)
+                    if isinstance(data_dict, dict) and "fillPrice" in data_dict:
+                        fill_price = float(data_dict["fillPrice"])
+
+            if fill_price is None:
+                # On n’a pas réussi à extraire le fill price → log et on abandonne
+                logger.error(
+                    "Impossible de récupérer 'fillPrice' dans l’AddOrderResp pour %s. Contenu : %r",
+                    symbol, resp
+                )
                 return
 
-            for order in open_orders:
-                try:
-                    self.cancel_futures_order(order.id)
-                    self.logger.info(f"✅ Ordre annulé : {order.id}")
-                except Exception as e:
-                    self.logger.error(f"Erreur annulation ordre {order.id} : {e}")
+            timestamp = datetime.now(TZ_PARIS).isoformat()
 
-            self.logger.info(f"✅ {len(open_orders)} ordres annulés.")
+            # 4) Calcul du PnL réalisé
+            # Sur USDT-marged (XBTUSDTM), entry et fill_price sont en USDT, size correspond à nombre de contrats,
+            # et 1 contrat = 0.001 BTC ; mais comme on stocke entry_price déjà en USDT par contrat,
+            # on peut calculer le PnL USDT directement :
+            #    PnL % = (fill_price - entry) / entry      si LONG
+            #    PnL % = (entry - fill_price) / entry      si SHORT
+            if side == "LONG":
+                pnl_pct = (fill_price - entry) / entry
+            else:
+                pnl_pct = (entry - fill_price) / entry
+
+            # PnL en USDT : on convertit selon le type de contrat :
+            if symbol.endswith("USDTM"):
+                # USDT-marged : 1 contrat = 0.001 BTC, mais entry & fill sont déjà en USDT par contrat,
+                # donc la formule simplifiée est :
+                #    PnL_USDT = pnl_pct * (entry * size / leverage) 
+                pnl_usdt = pnl_pct * (entry * size / LEVERAGE)
+            else:
+                # Coin-marged (XBTUSDM) : le PnL brut est en BTC :
+                #    PnL_BTC = pnl_pct * (entry * size / leverage) 
+                # puis on convertit en USDT pour reporter dans budget :
+                pnl_btc = pnl_pct * (entry * size / LEVERAGE)
+                mark_price = await self.get_mark_price(symbol)
+                pnl_usdt  = pnl_btc * mark_price
+
+            pnl_usdt = round(pnl_usdt, 2)
+
+            # 5) Mise à jour du budget
+            self.state["budget_restant"] += pnl_usdt
+            if pnl_usdt >= 0:
+                self.state["profits_proteges"] += pnl_usdt
+            else:
+                self.state["pertes_cumulees"] += abs(pnl_usdt)
+
+            # 6) Ajout à l’historique
+            self.state["historique"].append({
+                "symbol": symbol,
+                "side": side,
+                "entry_price": entry,
+                "exit_price": fill_price,
+                "size": size,
+                "pnl_usdt": pnl_usdt,
+                "timestamp": timestamp
+            })
+
+            # 7) Suppression de la position active du state
+            del self.state["positions_actives"][symbol]
+            self._save_state()
+
+            # 8) Notification Telegram
+            await self.send_telegram_message(
+                f"✅ CLÔTURE {side} {symbol} : exit_price={fill_price:.2f}, PnL={pnl_usdt:.2f} USDT.\n"
+                f"Budget restant = {self.state['budget_restant']:.2f} USDT."
+            )
+            logger.info("Position clôturée %s %s PnL=%f USDT", symbol, side, pnl_usdt)
+
         except Exception as e:
-            self.logger.error(f"cancel_all_open_orders error: {e}")
+            logger.error("Erreur close_position(%s) : %s", symbol, e)
+            await self.send_telegram_message(f"❌ Erreur fermeture position {symbol} : {e}")
+            return
 
 
-    def cancel_futures_order(self, oid: str) -> None:
+    # --------------------------------------------------------
+    # 4.9. Vérification Take Profit / Stop Loss / Trailing Stop
+    # --------------------------------------------------------
+    async def check_risk_management(self, symbol: str):
         """
-        Annule l'ordre futures correspondant à order_id.
+        Pour la position active sur 'symbol', on récupère le PnL live via l’API KuCoin
+        (avgEntryPrice, unrealisedPnl et posMargin), on détermine le side d’après currentQty,
+        et on vérifie si TP, SL ou Trailing Stop sont atteints.
+        - TP => clôture si PnL % >= TAKE_PROFIT
+        - SL => clôture si PnL % <= -STOP_LOSS
+        - Trailing => si activé, on met à jour best_price et on clôture si drawdown > TRAILING_STOP
         """
-        try:
-            self.futures_service.get_order_api().cancel_order_by_id(
-                FuturesCancelOrderReqBuilder().set_order_id(oid).build()
-            )
-        except Exception as e:
-            self.logger.error(f"cancel_futures_order error: {e}")
-
-    def close_position(self, symbol: str):
-        try:
-            position_resp = self.futures_service.get_positions_api().get_position_by_symbol(
-                GetPositionReqBuilder().set_symbol(symbol).build()
-            )
-
-            side = position_resp.side.lower()
-            size = float(position_resp.current_qty)
-            price = float(position_resp.mark_price)
-
-            if size == 0:
-                self.logger.info(f"Aucune position ouverte sur {symbol} à fermer.")
-                return
-
-            # Ordre inverse pour fermer la position
-            closing_side = "sell" if side == "buy" else "buy"
-            self.logger.info(f"Fermeture de position {side.upper()} de {size} contrats sur {symbol} à {price:.2f}")
-
-            order_id = self.place_futures_order(
-                side=closing_side,
-                size=size,
-                price=price,
-                symbol=symbol,
-                reduce_only=True  # Important pour éviter une ouverture inverse
-            )
-
-            if order_id:
-                self.send_telegram_message(
-                    f"📉 Position {side.upper()} fermée sur {symbol} ({size} contrats) au prix de {price:.2f}"
-                )
-
-        except Exception as e:
-            self.logger.error(f"Erreur lors de la fermeture de la position sur {symbol} : {e}")
-
-
-    async def adjust_grid(self, context=None) -> None:
-        # --- Annulation de tous les ordres ouverts sur KuCoin ---
-        self.cancel_all_open_orders(SYMBOL_LONG)
-        self.cancel_all_open_orders(SYMBOL_SHORT)
-        # Réinitialisation de l’état local
-        self.active_orders.clear()
-        self.grid_prices.clear()
-
-        await self.send_telegram_message("📛 Tous les ordres ouverts ont été annulés pour réinitialisation de la grille.")
-
-        # --- Récupération des infos du symbole LONG ---
-        symbol_long_info = self.futures_service.get_market_api().get_symbol(
-            GetSymbolReqBuilder().set_symbol(SYMBOL_LONG).build()
-        )
-        tick_long = float(symbol_long_info.tick_size)
-        multiplier_long = float(symbol_long_info.multiplier)  # valeur en BTC d’un contrat (ex: 0.001)
-
-        # --- Récupération des infos du symbole SHORT ---
-        symbol_short_info = self.futures_service.get_market_api().get_symbol(
-            GetSymbolReqBuilder().set_symbol(SYMBOL_SHORT).build()
-        )
-        tick_short = float(symbol_short_info.tick_size)
-        multiplier_short = float(symbol_short_info.multiplier)  # valeur en BTC d’un contrat (ex: 0.001)
-
-        try:
-            decimals_long = int(round(-math.log10(tick_long)))
-            decimals_short = int(round(-math.log10(tick_short)))
-        except Exception:
-            decimals_long = 6
-            decimals_short = 6
-
-        # --- Calcul des bornes ATR LONG ---
-        lower_long, upper_long = self.calculate_atr_bounds(SYMBOL_LONG)
-        center_long = (lower_long + upper_long) / 2
-
-        # --- Calcul des bornes ATR SHORT ---
-        lower_short, upper_short = self.calculate_atr_bounds(SYMBOL_SHORT)
-        center_short = (lower_short + upper_short) / 2
-
-        # --- Grilles BUY sous le prix et SELL au-dessus
-        buy_grid = [center_long - (i + 0.5) * (center_long - lower_long) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
-        sell_grid = [center_short + (i + 0.5) * (upper_short - center_short) / GRID_SIZE for i in range(1, GRID_SIZE + 1)]
-
-        self.grid_prices = buy_grid + sell_grid
-
-        # ❇️ Répartition du budget
-        total_orders = GRID_SIZE * 2
-        usdt_per = (BUDGET / 2) / GRID_SIZE
-
-        btc_amount_long = usdt_per * LEVERAGE / center_long
-        size_f_long = btc_amount_long / multiplier_long
-        size_long = math.floor(size_f_long)
-        self.logger.info(f"BTC amount par ordre LONG : {btc_amount_long:.6f}, Multiplier: {multiplier_long}, Size float: {size_f_long}")
-
-        if size_long < 1:
-            self.logger.warning(
-                f"Budget insuffisant pour 1 contrat par ordre LONG (size_f={size_f_long:.2f} contrats) – skip adjust_grid. "
-                f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
-            )
-
-        # SHORT (XBTUSDM)
-        # 1 contrat = 1 USD, donc on prend simplement le montant en USD alloué avec levier
-        usd_amount_short = usdt_per * LEVERAGE
-        size_f_short = usd_amount_short  # 1 contrat = 1 USD
-        size_short = math.floor(size_f_short)
-        self.logger.info(f"BTC amount par ordre SHORT : {usd_amount_short:.6f}, Multiplier: {multiplier_short}, Size float: {size_f_short}")
-
-        if size_short < 1:
-            self.logger.warning(
-                f"Budget insuffisant pour 1 contrat par ordre SHORT (size_f={size_f_short:.2f} contrats) – skip adjust_grid. "
-                f"Réduisez GRID_SIZE ou augmentez BUDGET/LEVERAGE."
-            )
-
-        # --- Placement des ordres ---
-        for price in buy_grid:
-            adjusted_price = price * (1 - SLIPPAGE_BUFFER)
-            buy_price = round(round(adjusted_price / tick_long) * tick_long, decimals_long)
-            order_id = self.place_futures_order("buy", size_long, buy_price, SYMBOL_LONG)
-            if order_id:
-                self.active_orders.append({"id": order_id, "side": "buy", "price": buy_price, "size": size_long})
-
-        for price in sell_grid:
-            adjusted_price = price * (1 + SLIPPAGE_BUFFER)
-            sell_price = round(round(adjusted_price / tick_short) * tick_short, decimals_short)
-            order_id = self.place_futures_order("sell", size_short, sell_price, SYMBOL_SHORT)
-            if order_id:
-                self.active_orders.append({"id": order_id, "side": "sell", "price": sell_price, "size": size_short})
-
-        # --- Sauvegarde de l'état ---
-        self.save_state()
-
-        # --- Message Telegram clair ---
-        message = f"\n\U0001F4CA 📊 Grille ajustée: {GRID_SIZE} BUY + {GRID_SIZE} SELL ordres placés :\n"
-        for o in self.active_orders:
-            direction = "⬇️ LONG" if o['side'] == "buy" else "⬆️ SHORT"
-            currency = "USDT" if o['side'] == "buy" else "USD"
-            message += f"{direction} {o['size']} contrat(s) à {o['price']:.2f} USDT\n"
-
-        await self.send_telegram_message(message)
-        self.logger.info(f"📊 Grille ajustée: {GRID_SIZE} BUY + {GRID_SIZE} SELL ordres placés.")
-
-
-
-    async def monitor_orders(self, context=None) -> None:
-        for order in list(self.active_orders):
-            try:
-                # Récupération des infos de l’ordre
-                resp = self.futures_service.get_order_api().get_order_by_order_id(
-                    FuturesGetOrderReqBuilder().set_order_id(order['id']).build()
-                )
-
-                # Log de débogage pour inspecter la réponse
-                self.logger.debug(f"[DEBUG] Détails ordre {order['id']} : {resp.__dict__}")
-
-                # Certaines réponses sont encapsulées dans .data ou des attributs spécifiques
-                if hasattr(resp, "data") and hasattr(resp.data, "order_state"):
-                    order_state = resp.data.order_state
-                elif hasattr(resp, "order_state"):
-                    order_state = resp.order_state
-                else:
-                    order_state = None
-
-
-                if not order_state:
-                    continue  # Si pas d'état retourné, on ignore
-
-                side = order.get('side', 'unknown')
-                price = float(order.get('price', 0.0))
-                size = int(order.get('size', 0))
-
-                if order_state.lower() == "done":
-                    # ✅ Ordre exécuté avec succès
-                    await self.send_telegram_message(
-                        f"✅ ORDRE EXÉCUTÉ\n{side.upper()} {size} contrat(s) à {price:.2f} USDT"
-                    )
-                    self.active_orders.remove(order)
-
-                elif order_state.lower() == "cancelled":
-                    # ❌ Ordre annulé
-                    await self.send_telegram_message(
-                        f"❌ ORDRE ANNULÉ\n{side.upper()} {size} contrat(s) à {price:.2f} USDT"
-                    )
-                    self.active_orders.remove(order)
-
-                elif order_state.lower() in ["fail", "rejected"]:
-                    # ⚠️ Échec ou rejet de l’ordre
-                    await self.send_telegram_message(
-                        f"⚠️ ORDRE ÉCHOUÉ\n{side.upper()} {size} contrat(s) à {price:.2f} USDT"
-                    )
-                    self.active_orders.remove(order)
-
-            except Exception as e:
-                self.logger.error(f"Erreur surveillance ordre {order['id']} : {e}")
-
-
-
-    async def check_position_pnl(self, context=None) -> None:
+        # 1) On récupère toutes les positions futures
         try:
             req = GetPositionListData()
             positions = self.futures_service.get_positions_api().get_position_list(req).data
-
-            previous_positions = getattr(self, 'last_positions', {})
-            current_positions = {}
-
-            for pos in positions:
-                if pos.symbol not in (SYMBOL_LONG, SYMBOL_SHORT):
-                    continue
-
-                size = float(pos.current_qty)
-                if size == 0:
-                    continue
-
-                direction = "long" if size > 0 else "short"
-                entry_price = float(pos.avg_entry_price)
-                pnl = float(pos.unrealised_pnl)
-                pnl_pct = pnl / float(pos.pos_margin) 
-                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                symbol = pos.symbol
-
-                # Clé unique pour suivi des ouvertures/fermetures
-                position_key = f"{symbol}_{direction}_{entry_price:.2f}_{size}"
-                current_positions[position_key] = size
-
-                # Notification ouverture
-                if position_key not in previous_positions:
-                    msg = f"📈 POSITION OUVERTE ({direction.upper()}) [{symbol}] {size} contrat(s) à {entry_price:.2f} USDT"
-                    await self.send_telegram_message(msg)
-
-                # Take Profit / Stop Loss
-                if pnl_pct >= TAKE_PROFIT:
-                    msg = f"💰 TP {direction.upper()} [{symbol}] : +{pnl_pct:.2%}, fermeture {abs(size)} contrats."
-                    self.logger.info(msg)
-                    await self.send_telegram_message(msg)
-                    self.pnl_history.append({"type": "TP", "side": direction.upper(), "pnl_pct": pnl_pct, "symbol": symbol, "timestamp": now})
-                    self.close_position(symbol, "sell" if direction == "long" else "buy", abs(size))
-
-                elif pnl_pct <= -STOP_LOSS:
-                    msg = f"❌ SL {direction.upper()} [{symbol}] : {pnl_pct:.2%}, fermeture {abs(size)} contrats."
-                    self.logger.info(msg)
-                    await self.send_telegram_message(msg)
-                    self.pnl_history.append({"type": "SL", "side": direction.upper(), "pnl_pct": pnl_pct, "symbol": symbol, "timestamp": now})
-                    self.close_position(symbol, "sell" if direction == "long" else "buy", abs(size))
-
-            # Notification fermetures
-            closed_positions = set(previous_positions) - set(current_positions)
-            for pos_key in closed_positions:
-                await self.send_telegram_message(f"📉 POSITION FERMÉE : {pos_key.replace('_', ' | ')}")
-
-            self.last_positions = current_positions
-            self.save_state()
-
         except Exception as e:
-            self.logger.error(f"check_position_pnl error: {e}")
+            logger.error("Erreur récupération liste positions (%s) : %s", symbol, e)
+            return
 
+        # 2) On cherche la ligne de position qui nous intéresse : même symbol et currentQty != 0
+        pos_live = None
+        for p in positions:
+            if p.symbol != symbol:
+                continue
 
+            # Nombre de contrats en position : "currentQty" (placeholder pour JSON)
+            # Certains retours d'API peuvent utiliser "current_qty" ou "currentQty"
+            qty = 0.0
+            qty = float(p.current_qty)
 
-    def run(self) -> None:
-                jq = self.app.job_queue
-                # Notification de démarrage
-                jq.run_once(self.startup_notify, when=0)
-                self.logger.info(f"Active orders on startup: {self.active_orders}")
-                if not self.active_orders:
-                    # Construction initiale de la grille dès startup
-                    jq.run_once(self.adjust_grid, when=1)
+            if qty == 0:
+                # pas de position ouverte sur ce symbol
+                continue
+
+            # on a trouvé la position active (hedging possible => side="both", on ignore)
+            pos_live = p
+            break
+
+        if pos_live is None:
+            # La position n’existe plus chez KuCoin → la supprimer du state pour la ré-ouvrir plus tard
+            logger.info("Position %s n’existe plus en live. Suppression du state.", symbol)
+            del self.state["positions_actives"][symbol]
+            self._save_state()
+            return
+
+        # 3) Déterminer le side d’après currentQty
+        size_live = 0.0
+        size_live = float(pos_live.current_qty)
+
+        # Si size_live > 0 => long, si < 0 => short
+        direction = "LONG" if size_live > 0 else "SHORT"
+
+        # 4) Extraire avgEntryPrice, unrealisedPnl et posMargin
+        try:
+            entry_price_live = float(pos_live.avg_entry_price)
+            unrealised_pnl   = float(pos_live.unrealised_pnl)
+            pos_margin       = float(pos_live.pos_margin)
+        except Exception as e:
+            logger.error("Erreur extraction PnL/marge (%s) : %s", symbol, e)
+            return
+
+        if pos_margin <= 0:
+            return
+
+        pnl_pct = unrealised_pnl / pos_margin
+
+        # 5) Vérifier Take Profit / Stop Loss
+        if pnl_pct >= TAKE_PROFIT:
+            await self.send_telegram_message(
+                f"🎯 TP atteint pour {symbol} ({direction}), PnL % = {pnl_pct:.4f}."
+            )
+            await self.close_position(symbol)
+            return
+
+        if pnl_pct <= -STOP_LOSS:
+            await self.send_telegram_message(
+                f"🛑 SL atteint pour {symbol} ({direction}), PnL % = {pnl_pct:.4f}."
+            )
+            await self.close_position(symbol)
+            return
+
+        # 6) Vérifier Trailing Stop si activé
+        if TRAILING_ENABLED:
+            best = self.trailing_high_low.get(symbol)
+            # Si pas encore initialisé, on prend entry_price_live comme extrême initial
+            if best is None:
+                self.trailing_high_low[symbol] = entry_price_live
+                return
+
+            # Récupérer le mark_price actuel pour calculer drawdown/drawup
+            # On peut soit ré-appeler get_mark_price(), soit lire pos_live["markPrice"] si disponible
+            mark_price = None
+            if pos_live.mark_price is not None:
+                mark_price = float(pos_live.mark_price)
+            else:
+                try:
+                    mark_price = await self.get_mark_price(symbol)
+                except:
+                    mark_price = None
+
+            if mark_price is None or mark_price <= 0:
+                return
+
+            if direction == "LONG":
+                # On met à jour si le prix monte (meilleur)
+                if mark_price > best:
+                    self.trailing_high_low[symbol] = mark_price
+                    return
+                # Sinon, calculer le drawdown par rapport au maximum
+                drawdown = (self.trailing_high_low[symbol] - mark_price) / self.trailing_high_low[symbol]
+                if drawdown >= TRAILING_STOP:
+                    await self.send_telegram_message(
+                        f"⏳ Trailing Stop LONG {symbol} déclenché (drawdown {drawdown:.4f})."
+                    )
+                    await self.close_position(symbol)
+                    return
+
+            else:  # direction == "SHORT"
+                # On met à jour si le prix descend (meilleur pour short)
+                if mark_price < best:
+                    self.trailing_high_low[symbol] = mark_price
+                    return
+                # Sinon, calculer le drawup
+                drawup = (mark_price - self.trailing_high_low[symbol]) / self.trailing_high_low[symbol]
+                if drawup >= TRAILING_STOP:
+                    await self.send_telegram_message(
+                        f"⏳ Trailing Stop SHORT {symbol} déclenché (drawup {drawup:.4f})."
+                    )
+                    await self.close_position(symbol)
+                    return
+
+    # --------------------------------------------------------
+    # 4.10. Rééquilibrage périodique des positions
+    # --------------------------------------------------------
+    async def rebalance(self):
+        """
+        Cette méthode est appelée toutes les UPDATE_INTERVAL_MIN minutes.
+        - Récupère les dernières bougies, calcule RSI+EMA, détermine la tendance.
+        - Calcule la répartition notionnelle pour chaque position (long & short).
+        - Pour chaque symbole :
+            • Si position active → check_risk_management()
+            • Sinon, si la part notionnelle > 0 → open_position()
+        """
+
+        # 1) Récupérer les indicateurs sur SYMBOL_LONG (on l’utilise comme proxy pour BTC)
+        df = await self.fetch_klines(SYMBOL_LONG, interval_min=1, limit=EMA_LONG_PERIOD + RSI_PERIOD + 5)
+        df = self.compute_indicators(df)
+        tendance = self.determine_trend(df)
+        now_str = datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M:%S")
+        await self.send_telegram_message(f"⏱️ Rééquilibrage à {now_str} — Tendance estimée : {tendance.upper()}")
+
+        # 2) Déterminer la répartition notionnelle (en USDT) pour chaque symbole
+        # Stratégie simple :
+        #   - Si bullish : tout vers le long
+        #   - Si bearish : tout vers le short
+        #   - Sinon (neutral) : on répartit selon REPARTITION_LONG / REPARTITION_SHORT
+        budget_disponible = self.state["budget_restant"]
+        if tendance == "bullish":
+            notional_long  = self.state["budget_restant"] * REPARTITION_LONG
+            notional_short = self.state["budget_restant"] * REPARTITION_SHORT
+        elif tendance == "bearish":
+            notional_long  = self.state["budget_restant"] * REPARTITION_SHORT
+            notional_short = self.state["budget_restant"] * REPARTITION_LONG
+        else:
+            notional_long  = self.state["budget_restant"] * 0.5
+            notional_short = self.state["budget_restant"] * 0.5
+
+        await self.send_telegram_message(f"⏱️ Allocation de : {notional_long} USD en LONG")
+        await self.send_telegram_message(f"⏱️ Allocation de : {notional_short} USD en SHORT")
+
+        # 3) Traiter chaque symbole séparément
+        # On stocke dans un dict pour factoriser le code
+        targets = {
+            SYMBOL_LONG:  {"notional": notional_long,  "side": "LONG"},
+            SYMBOL_SHORT: {"notional": notional_short, "side": "SHORT"},
+        }
+
+        for symbol, info_sym in targets.items():
+            notional_usdt = info_sym["notional"]
+            side_desire   = info_sym["side"]
+
+            # 3.1. Si une position active existe dans self.state, on appelle check_risk_management
+            if symbol in self.state["positions_actives"]:
+                # Il y a déjà une position ouverte pour ce symbole : on la gère
+                await self.check_risk_management(symbol)
+
+            else:
+                # 3.2. Aucune position active pour ce symbole : on regarde si on doit en ouvrir une
+                if notional_usdt > 0:
+                    # On ouvre une nouvelle position avec la partie notionnelle calculée
+                    await self.send_telegram_message(
+                        f"🔎 Aucune position active sur {symbol}. Ouverture d'une position {side_desire} pour notional={notional_usdt:.2f} USDT."
+                    )
+                    await self.open_position(symbol, side_desire, notional_usdt)
                 else:
-                    self.logger.info("Ordres rechargés, skip initial grid adjustment")
-                # Planification des ajustements périodiques
-                jq.run_repeating(self.adjust_grid, interval=ADJUST_INTERVAL_MIN * 60, first=ADJUST_INTERVAL_MIN * 60)
-                # Monitoring des ordres
-                jq.run_repeating(self.monitor_orders, interval=5, first=10)
-                # Rapport PnL
-                jq.run_repeating(self.cmd_pnl, interval=PNL_REPORT_INTERVAL_H * 3600, first=PNL_REPORT_INTERVAL_H * 3600)
-                jq.run_repeating(self.check_position_pnl, interval=10, first=15)
-                # Démarrage du bot
-                self.app.run_polling()
+                    # Si notional_usdt == 0, on n'ouvre rien (tendance ne le requiert pas)
+                    await self.send_telegram_message(
+                        f"ℹ️ Pas de position {side_desire} pour {symbol} (notional={notional_usdt:.2f} USDT)."
+                    )
 
-if __name__ == '__main__':
-    GridTradingBotFutures().run()
+
+    # --------------------------------------------------------
+    # 4.11. Dashboard horaire
+    # --------------------------------------------------------
+    async def send_hourly_dashboard(self):
+        """
+        Envoi un résumé chaque heure à HH:00.
+        - Tendance courante
+        - Budget actuel
+        - Positions ouvertes et leurs PnL non réalisés (en USDT ou BTC selon le contrat)
+        - Historique simplifié (nombre de trades, dernier PnL)
+        """
+        # 1) Tendance actuelle (inchangé)
+        df = await self.fetch_klines(SYMBOL_LONG, interval_min=1, limit=EMA_LONG_PERIOD + RSI_PERIOD + 5)
+        df = self.compute_indicators(df)
+        tendance = self.determine_trend(df)
+
+        # 2) Budget
+        budget = self.state["budget_restant"]
+
+        # 3) Positions ouvertes : on va utiliser get_position_list pour récupérer PnL/marge
+        try:
+            req_pos = GetPositionListData()
+            positions = self.futures_service.get_positions_api().get_position_list(req_pos).data
+        except Exception as e:
+            logger.error("Erreur get_position_list : %s", e)
+            positions = []
+
+        messages = []
+        for pos in positions:
+            # On ne garde que nos deux symboles
+            if pos.symbol not in (SYMBOL_LONG, SYMBOL_SHORT):
+                continue
+
+            # Si pas de qty, pas de position active
+            size_live = float(getattr(pos, "current_qty", 0.0))
+            if size_live == 0:
+                continue
+
+            # Déduire side uniquement d'après current_qty
+            direction = "LONG" if size_live > 0 else "SHORT"
+
+            # Lire le prix d'entrée moyen, le mark price, PnL non réalisé et marge
+            entry_price = float(getattr(pos, "avg_entry_price", 0.0))
+
+            # Le champ `markPrice` est souvent directement accessible sur pos (selon la version du SDK)
+            try:
+                mark_price = float(getattr(pos, "mark_price", 0.0))
+            except Exception:
+                # Si `mark_price` n’existe pas, on retombe sur notre get_mark_price
+                mark_price = await self.get_mark_price(pos.symbol)
+
+            # Unrealised PnL brut
+            pnl_raw = float(getattr(pos, "unrealised_pnl", 0.0))
+            pos_margin = float(getattr(pos, "pos_margin", 0.0))
+
+            # Affichage adapté selon le type de contrat :
+            if pos.symbol.endswith("USDTM"):
+                # XBTUSDTM : PnL déjà en USDT
+                pnl_usdt = pnl_raw
+                messages.append(
+                    f"{pos.symbol} {direction} | entry={entry_price:.2f} | mark={mark_price:.2f} | PnL={pnl_usdt:.2f} USDT"
+                )
+            else:
+                # XBTUSDM (coin-marged) : PnL est en BTC
+                pnl_btc = pnl_raw
+                # On convertit en USDT pour homogénéiser, si vous le souhaitez
+                pnl_in_usdt = pnl_btc * mark_price
+                messages.append(
+                    f"{pos.symbol} {direction} | entry={entry_price:.2f} | mark={mark_price:.2f} | "
+                    f"PnL={pnl_btc:.6f} BTC ({pnl_in_usdt:.2f} USDT)"
+                )
+
+        if not messages:
+            positions_msg = "Aucune position active."
+        else:
+            positions_msg = "\n".join(messages)
+
+        # 4) Historique simplifié
+        n_trades = len(self.state["historique"])
+        dernier_pnl = self.state["historique"][-1]["pnl_usdt"] if n_trades > 0 else 0.0
+
+        texte = (
+            f"📊 **DASHBOARD HORAIRE**\n\n"
+            f"• Tendance : {tendance.upper()}\n"
+            f"• Budget restant : {budget:.2f} USDT\n"
+            f"• Positions ouvertes :\n{positions_msg}\n\n"
+            f"• Nombre de trades effectués : {n_trades}\n"
+            f"• Dernier PnL réalisé : {dernier_pnl:.2f} USDT\n"
+        )
+        # Envoi Telegram
+        try:
+            await self.telegram_bot.send_message(chat_id=self.telegram_chat_id, text=texte, parse_mode="Markdown")
+        except Exception as e:
+            logger.error("Erreur envoi dashboard Telegram : %s", e)
+
+
+    # --------------------------------------------------------
+    # 4.12. Boucle principale asyncio
+    # --------------------------------------------------------
+    async def run(self):
+        logger.info("Démarrage du DualRSIEMA-Bot.")
+        await self.send_telegram_message("Démarrage du DualRSIEMA-Bot.")
+        # 1) À l’initialisation, on lance éventuellement l’ouverture initiale si pas de position existante
+        #    (on attend le premier intervalle pour décider de la tendance).
+        
+        # --- Lancement du “listener” Telegram en background ---
+        #   On démarre le polling pour récupérer les commandes /statut
+        #   ( Vous pouvez aussi passer par webhook, mais le plus simple est polling )
+        await self.telegram_app.initialize()
+        await self.telegram_app.start()
+        # Lance polling en tâche de fond
+        await self.telegram_app.updater.start_polling()
+
+        # 2) On programme la tâche de rééquilibrage en boucle infinie
+        async def boucle_rebalance():
+            while True:
+                try:
+                    await self.rebalance()
+                except Exception as e:
+                    logger.error("Erreur dans boucle_rebalance : %s", e)
+                await asyncio.sleep(UPDATE_INTERVAL_MIN * 60)
+
+        # 3) On programme la tâche du dashboard horaire
+        async def boucle_dashboard():
+            while True:
+                now = datetime.now(TZ_PARIS)
+                # On calcule le temps restant jusqu’à la prochaine heure pile
+                demain_prochaine_heure = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+                delta = (demain_prochaine_heure -	now).total_seconds()
+                await asyncio.sleep(delta)
+                try:
+                    await self.send_hourly_dashboard()
+                except Exception as e:
+                    logger.error("Erreur dans boucle_dashboard : %s", e)
+
+        # Lancement parallèle des deux boucles
+        await asyncio.gather(boucle_rebalance(), boucle_dashboard())
+
+# ------------------------------------------------------------
+# 5. Lancement du bot
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    bot = DualRSIEMABot()
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Arrêt manuel demandé. Sauvegarde de l’état avant exit.")
+        bot._save_state()
+        exit(0)
