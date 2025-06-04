@@ -1,78 +1,111 @@
-# Bot de Trading Futures ATR (KuCoin)
+# 📈 KuCoin Dual Position Bot – RSI + EMA Trend Strategy
 
-**Bot de trading en grille adaptative** utilisant l'**Average True Range (ATR)** sur le marché **futures** de KuCoin, avec :
-- Ajustement automatique de la grille toutes les 15 minutes
-- Stop-Loss et Take-Profit par niveau
-- Reporting PnL et historique
-- Mode **sandbox** pour tests sans risques
-- Persistence via JSON (`DATA_DIR/state.json`)
-- Notifications enrichies sur Telegram
-- Commandes `/pnl`, `/statut`, `/balance`, `/startup_notify`
+Ce bot permet d’ouvrir et de maintenir deux positions simultanées (LONG et SHORT) sur deux paires KuCoin Futures (ex : XBTUSDTM et XBTUSDM), avec rééquilibrage automatique en fonction de la tendance détectée via RSI et EMA. Il gère le Take Profit, le Stop Loss, le trailing stop, et sauvegarde les profits tout en assurant une persistance complète.
 
-## Prérequis
+---
 
-- Python 3.8+
-- Un compte KuCoin avec clé API (spot/futures) et passphrase
-- Un bot Telegram (token & chat_id)
-- Variables d'environnement configurées (via un fichier `.env`)
+## ⚙️ Fonctionnalités
+- 📊 Stratégie à double position (long/short)
+- 📊 Récupération des klines en temps réel
+- 🔄 Rebalancing toutes les X minutes (paramétrable)
+- 🔍 Détection de la tendance via RSI et EMA
+- 🧠 Allocation automatique du capital (en USDT)
+- 💰 Prise de bénéfices, Stop loss, Trailing Stop
+- 🧾 Historique PnL et capital actif
+- 💾 Persistance du budget et des profits dans `state_trailing_persist.json`
+- 📩 Notifications Telegram
+- ⏱️ Dashboard horaire automatique
+- 🔄 Redémarrage résilient
 
-## Installation
+---
 
-1. Clonez ou copiez le dossier du bot :
-   ```bash
-   git clone <votre_repo>
-   cd grid-bot
-   ```
+## 🔧 Configuration via `.env`
 
-2. Créez un environnement virtuel et installez les dépendances :
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
+```env
+# Paires utilisées
+SYMBOL_LONG=XBTUSDTM
+SYMBOL_SHORT=XBTUSDM
 
-## Configuration
+# Budget total à répartir
+BUDGET=1000
 
-Créez un fichier `.env` à la racine du projet :
+# Répartition initiale
+REPARTITION_LONG=0.5
+REPARTITION_SHORT=0.5
 
-```ini
-KUCOIN_API_KEY=...
-KUCOIN_API_SECRET=...
-KUCOIN_API_PASSPHRASE=...
-TELEGRAM_TOKEN=...
-TELEGRAM_CHAT_ID=...
-SYMBOL=BTCUSDTM            # Contrat futures (ex: XBTUSDTM pour BTC)
-BUDGET=1000                # Budget USDT total
-LEVERAGE=10                # Levier (ex: 10)
-GRID_SIZE=10               # Nombre de niveaux de grille
-ATR_PERIOD=14              # Période ATR (en heures)
-STOP_LOSS=0.01             # Stop-Loss 1%
-TAKE_PROFIT=0.02           # Take-Profit 2%
-ADJUST_INTERVAL_MIN=15     # Intervalle de réajustement (minutes)
-PNL_REPORT_INTERVAL_H=1    # Intervalle reporting PnL (heures)
-SANDBOX=false              # true = mode sandbox (spot uniquement)
-DATA_DIR=./data            # Dossier de persistence
+# Levier
+LEVERAGE=6
+
+# SL/TP
+TAKE_PROFIT=0.02
+STOP_LOSS=0.01
+TRAILING_STOP=0.01
+TRAILING_ENABLED=true
+
+# Tendance
+RSI_PERIOD=14
+EMA_PERIOD=50
+RSI_THRESHOLD_HIGH=70
+RSI_THRESHOLD_LOW=30
+
+# Intervalle d'ajustement
+UPDATE_INTERVAL_MIN=15
+
+# Telegram
+TELEGRAM_BOT_TOKEN=xxx
+TELEGRAM_CHAT_ID=xxx
+
+# Persistance directory
+DATA_DIR=./datas
+
 ```
 
-## Utilisation
+---
 
-Une fois le `.env` en place :
+## 🚀 Lancer le bot
+
 ```bash
+pip install -r requirements.txt
 python bot.py
 ```
 
-### Commandes Telegram
+---
 
-- `/startup_notify` : confirmation de démarrage
-- `/pnl`          : affiche l’historique (5 derniers) des rapports PnL
-- `/statut`       : état actuel de la grille (niveaux, spread, ordres actifs)
-- `/balance`      : balance USDT disponible en futures
+## 🧠 Principe de la stratégie
 
-## Fichiers générés
+- Une position LONG et une SHORT sont ouvertes simultanément.
+- Le capital est réparti dynamiquement selon la tendance BTC.
+- Une position est clôturée si TP, SL ou trailing stop est atteint.
+- Le unrealized_pnl affiché par Kucoin est utilisé pour monitorer TP/SL
+- Lorsqu’une position se ferme, une nouvelle est ouverte immédiatement.
+- Le capital est ajusté selon les pertes (déduites) ou les gains (reconsolidés uniquement jusqu’à récupérer le capital initial).
 
-- `state.json` dans `DATA_DIR/` : sauvegarde de l’état (grille, orders, PnL...)
+---
 
-## Avertissement
+## 💾 Persistance
 
-Ce bot est fourni **à titre éducatif**. Utiliser à vos risques et périls. Consultez un conseiller financier si nécessaire.
+- Le fichier `state_trailing_persist.json` contient :
+  - Le budget actuel restant
+  - Les pertes cumulées
+  - Les profits protégés
+  - Les positions actives
+  - L’historique de profit/perte
+
+---
+
+## 📩 Notifications
+
+- Chaque décision est loguée dans Telegram.
+- Un dashboard complet est envoyé chaque heure avec :
+  - La tendance actuelle
+  - Le capital actif
+  - Les PnL de chaque position
+
+---
+
+## 📁 Fichiers
+- `bot.py` : cœur de la logique
+- `state_trailing_persist.json` : fichier persistant
+- `.env` : variables de configuration (à créer)
+
+---
